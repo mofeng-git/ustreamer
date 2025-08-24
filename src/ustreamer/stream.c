@@ -184,13 +184,19 @@ void us_stream_loop(us_stream_s *stream) {
 				hwenc_type = US_HWENC_AMF;
 			} else if (strcasecmp(stream->h264_hwenc, "v4l2m2m") == 0) {
 				hwenc_type = US_HWENC_V4L2_M2M;
+			} else if (strcasecmp(stream->h264_hwenc, "rkmpp") == 0) {
+				hwenc_type = US_HWENC_RKMPP;
 			} else if (strcasecmp(stream->h264_hwenc, "mediacodec") == 0) {
 				hwenc_type = US_HWENC_MEDIACODEC;
 			} else if (strcasecmp(stream->h264_hwenc, "videotoolbox") == 0) {
 				hwenc_type = US_HWENC_VIDEOTOOLBOX;
+			} else {
+				US_LOG_ERROR("H264: Unknown hardware encoder type '%s', falling back to software", stream->h264_hwenc);
+				hwenc_type = US_HWENC_LIBX264;
 			}
 		}
 		
+		US_LOG_INFO("H264: Attempting to initialize %s encoder", us_hwenc_type_to_string(hwenc_type));
 		us_hwenc_error_e error = us_ffmpeg_hwenc_create(&run->ffmpeg_enc, hwenc_type, 
 			cap->width, cap->height, stream->h264_bitrate, stream->h264_gop);
 		
