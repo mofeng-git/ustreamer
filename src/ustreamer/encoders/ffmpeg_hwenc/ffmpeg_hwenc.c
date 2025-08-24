@@ -150,7 +150,7 @@ static const char* _get_hw_device_type(us_hwenc_type_e type) {
 		case US_HWENC_VAAPI: return "vaapi";
 		case US_HWENC_NVENC: return "cuda";
 		case US_HWENC_AMF: return "d3d11va";
-		case US_HWENC_RKMPP: return "rkmpp";
+		case US_HWENC_RKMPP: return NULL; // RKMPP不需要硬件设备上下文
 		case US_HWENC_VIDEOTOOLBOX: return "videotoolbox";
 		default: return NULL;
 	}
@@ -725,10 +725,10 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 
 	// 确定输入和输出格式
 	enum AVPixelFormat input_format;
-	enum AVPixelFormat output_format = (encoder->type == US_HWENC_VAAPI) ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+	enum AVPixelFormat output_format = AV_PIX_FMT_YUV420P; // 默认格式
 	
-	// 对于VAAPI，确保使用NV12格式以匹配硬件帧上下文
-	if (encoder->type == US_HWENC_VAAPI) {
+	// 对于VAAPI和RKMPP，使用NV12格式
+	if (encoder->type == US_HWENC_VAAPI || encoder->type == US_HWENC_RKMPP) {
 		output_format = AV_PIX_FMT_NV12;
 	}
 	
