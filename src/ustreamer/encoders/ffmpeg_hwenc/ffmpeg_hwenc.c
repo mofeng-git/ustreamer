@@ -727,7 +727,12 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	uint64_t start_time = us_get_now_monotonic_u64();
 
 	// 检查输入帧格式
-	if (src->format != V4L2_PIX_FMT_RGB24 && src->format != V4L2_PIX_FMT_YUYV) {
+	if (src->format != V4L2_PIX_FMT_RGB24 && 
+	    src->format != V4L2_PIX_FMT_YUYV && 
+	    src->format != V4L2_PIX_FMT_NV12 &&
+	    src->format != V4L2_PIX_FMT_NV16 &&
+	    src->format != V4L2_PIX_FMT_NV21 &&
+	    src->format != V4L2_PIX_FMT_NV24) {
 		pthread_mutex_unlock(&encoder->mutex);
 		US_LOG_ERROR("HWENC: Unsupported input format: %u", src->format);
 		return US_HWENC_ERROR_FORMAT_UNSUPPORTED;
@@ -750,6 +755,14 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		input_format = AV_PIX_FMT_RGB24;
 	} else if (src->format == V4L2_PIX_FMT_YUYV) {
 		input_format = AV_PIX_FMT_YUYV422;
+	} else if (src->format == V4L2_PIX_FMT_NV12) {
+		input_format = AV_PIX_FMT_NV12;
+	} else if (src->format == V4L2_PIX_FMT_NV16) {
+		input_format = AV_PIX_FMT_NV16;
+	} else if (src->format == V4L2_PIX_FMT_NV21) {
+		input_format = AV_PIX_FMT_NV21;
+	} else if (src->format == V4L2_PIX_FMT_NV24) {
+		input_format = AV_PIX_FMT_NV24;
 	} else {
 		pthread_mutex_unlock(&encoder->mutex);
 		US_LOG_ERROR("HWENC: Unsupported format conversion from: %u", src->format);
@@ -777,6 +790,21 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	// 准备输入数据
 	const uint8_t *src_data[4] = {src->data, NULL, NULL, NULL};
 	int src_linesize[4] = {(int)src->stride, 0, 0, 0};
+	
+	// 对于NV格式，需要设置UV平面数据指针
+	if (src->format == V4L2_PIX_FMT_NV12 || src->format == V4L2_PIX_FMT_NV21) {
+		// NV12/NV21: UV平面在Y平面之后，高度为Y平面的一半
+		src_data[1] = src->data + src->stride * encoder->height;
+		src_linesize[1] = (int)src->stride; // UV平面stride与Y平面相同
+	} else if (src->format == V4L2_PIX_FMT_NV16) {
+		// NV16: UV平面在Y平面之后，高度与Y平面相同
+		src_data[1] = src->data + src->stride * encoder->height;
+		src_linesize[1] = (int)src->stride;
+	} else if (src->format == V4L2_PIX_FMT_NV24) {
+		// NV24: UV平面在Y平面之后，高度与Y平面相同，宽度为Y平面的2倍
+		src_data[1] = src->data + src->stride * encoder->height;
+		src_linesize[1] = (int)src->stride * 2;
+	}
 
 	// 分配软件帧缓冲区
 	AVFrame *yuv_frame = av_frame_alloc();
@@ -826,11 +854,35 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		           yuv_frame->linesize[0], yuv_frame->linesize[1]);
 	}
 
-	// 格式转换
-	sws_scale(encoder->sws_ctx,
-		src_data, src_linesize,
-		0, encoder->height,
-		yuv_frame->data, yuv_frame->linesize);
+	// 格式转换或直接拷贝
+	if (input_format == output_format && input_format == AV_PIX_FMT_NV12) {
+		// NV12->NV12直接拷贝优化，避免不必要的格式转换
+		US_LOG_DEBUG("HWENC: Using direct copy for NV12->NV12");
+		
+		// 拷贝Y平面
+		const uint8_t *src_y = src_data[0];
+		uint8_t *dst_y = yuv_frame->data[0];
+		for (int y = 0; y < encoder->height; y++) {
+			memcpy(dst_y, src_y, encoder->width);
+			src_y += src_linesize[0];
+			dst_y += yuv_frame->linesize[0];
+		}
+		
+		// 拷贝UV平面
+		const uint8_t *src_uv = src_data[1];
+		uint8_t *dst_uv = yuv_frame->data[1];
+		for (int y = 0; y < encoder->height / 2; y++) {
+			memcpy(dst_uv, src_uv, encoder->width);
+			src_uv += src_linesize[1];
+			dst_uv += yuv_frame->linesize[1];
+		}
+	} else {
+		// 使用sws_scale进行格式转换
+		sws_scale(encoder->sws_ctx,
+			src_data, src_linesize,
+			0, encoder->height,
+			yuv_frame->data, yuv_frame->linesize);
+	}
 
 	// 设置帧时间戳
 	yuv_frame->pts = encoder->frame_number;
