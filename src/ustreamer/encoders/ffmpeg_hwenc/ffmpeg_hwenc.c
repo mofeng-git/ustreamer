@@ -230,7 +230,12 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 	enc->ctx->bit_rate = bitrate_kbps * 1000;
 	enc->ctx->gop_size = gop_size;
 	enc->ctx->max_b_frames = 0;
-	enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+	// 根据编码器类型设置像素格式
+	if (type == US_HWENC_VAAPI || type == US_HWENC_RKMPP) {
+		enc->ctx->pix_fmt = AV_PIX_FMT_NV12;
+	} else {
+		enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+	}
 
 	// 硬件设备初始化
 	const char *hw_device_type = _get_hw_device_type(type);
@@ -475,7 +480,12 @@ us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
 	enc->ctx->bit_rate = bitrate_kbps * 1000;
 	enc->ctx->gop_size = gop_size;
 	enc->ctx->max_b_frames = 0;
-	enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+	// 根据编码器类型设置像素格式
+	if (type == US_HWENC_VAAPI || type == US_HWENC_RKMPP) {
+		enc->ctx->pix_fmt = AV_PIX_FMT_NV12;
+	} else {
+		enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+	}
 
 	// 设置编码器选项
 	AVDictionary *opts = NULL;
@@ -731,7 +741,10 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	if (encoder->type == US_HWENC_VAAPI) {
 		output_format = AV_PIX_FMT_NV12;
 	}
-	// RKMPP使用YUV420P格式更稳定
+	// RKMPP使用NV12格式，与官方实现一致
+	else if (encoder->type == US_HWENC_RKMPP) {
+		output_format = AV_PIX_FMT_NV12;
+	}
 	
 	if (src->format == V4L2_PIX_FMT_RGB24) {
 		input_format = AV_PIX_FMT_RGB24;
@@ -776,11 +789,41 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	yuv_frame->width = encoder->width;
 	yuv_frame->height = encoder->height;
 
-	int ret = av_frame_get_buffer(yuv_frame, 32);
+	// RKMPP需要64字节对齐的缓冲区
+	int alignment = (encoder->type == US_HWENC_RKMPP) ? 64 : 32;
+	int ret = av_frame_get_buffer(yuv_frame, alignment);
 	if (ret < 0) {
 		av_frame_free(&yuv_frame);
 		pthread_mutex_unlock(&encoder->mutex);
 		return US_HWENC_ERROR_MEMORY;
+	}
+
+	// 对于RKMPP，验证linesize是否满足要求
+	if (encoder->type == US_HWENC_RKMPP) {
+		// 计算每个平面的最小字节宽度
+		int y_bytewidth = encoder->width;
+		int uv_bytewidth = encoder->width; // NV12格式UV平面宽度与Y相同
+		
+		// 检查Y平面linesize
+		if (abs(yuv_frame->linesize[0]) < y_bytewidth) {
+			US_LOG_ERROR("HWENC: RKMPP Y plane linesize (%d) < bytewidth (%d)", 
+			           abs(yuv_frame->linesize[0]), y_bytewidth);
+			av_frame_free(&yuv_frame);
+			pthread_mutex_unlock(&encoder->mutex);
+			return US_HWENC_ERROR_MEMORY;
+		}
+		
+		// 检查UV平面linesize (NV12格式)
+		if (output_format == AV_PIX_FMT_NV12 && abs(yuv_frame->linesize[1]) < uv_bytewidth) {
+			US_LOG_ERROR("HWENC: RKMPP UV plane linesize (%d) < bytewidth (%d)", 
+			           abs(yuv_frame->linesize[1]), uv_bytewidth);
+			av_frame_free(&yuv_frame);
+			pthread_mutex_unlock(&encoder->mutex);
+			return US_HWENC_ERROR_MEMORY;
+		}
+		
+		US_LOG_DEBUG("HWENC: RKMPP frame allocated - Y linesize: %d, UV linesize: %d", 
+		           yuv_frame->linesize[0], yuv_frame->linesize[1]);
 	}
 
 	// 格式转换
