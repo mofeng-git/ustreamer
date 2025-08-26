@@ -728,6 +728,7 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 
 	// 检查输入帧格式
 	if (src->format != V4L2_PIX_FMT_RGB24 && 
+	    src->format != V4L2_PIX_FMT_BGR24 &&
 	    src->format != V4L2_PIX_FMT_YUYV && 
 	    src->format != V4L2_PIX_FMT_NV12 &&
 	    src->format != V4L2_PIX_FMT_NV16 &&
@@ -753,6 +754,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	
 	if (src->format == V4L2_PIX_FMT_RGB24) {
 		input_format = AV_PIX_FMT_RGB24;
+	} else if (src->format == V4L2_PIX_FMT_BGR24) {
+		input_format = AV_PIX_FMT_BGR24;
 	} else if (src->format == V4L2_PIX_FMT_YUYV) {
 		input_format = AV_PIX_FMT_YUYV422;
 	} else if (src->format == V4L2_PIX_FMT_NV12) {
@@ -1121,7 +1124,12 @@ bool us_ffmpeg_hwenc_is_format_supported(us_hwenc_type_e encoder_type, uint32_t 
 	(void)encoder_type; // 避免编译器警告
 	switch (format) {
 		case V4L2_PIX_FMT_RGB24:
+		case V4L2_PIX_FMT_BGR24:
 		case V4L2_PIX_FMT_YUYV:
+		case V4L2_PIX_FMT_NV12:
+		case V4L2_PIX_FMT_NV16:
+		case V4L2_PIX_FMT_NV21:
+		case V4L2_PIX_FMT_NV24:
 			return true;
 		default:
 			return false;
