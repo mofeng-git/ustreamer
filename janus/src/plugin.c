@@ -247,7 +247,7 @@ static void *_acap_thread(void *arg) {
 			continue;
 		}
 
-		uint hz = 0;
+		uint hz = 44100;
 		us_acap_s *acap = NULL;
 
 		/*if (_check_tc358743_acap(&hz) < 0) {
