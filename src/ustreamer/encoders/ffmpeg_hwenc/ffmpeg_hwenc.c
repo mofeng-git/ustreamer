@@ -161,6 +161,35 @@ static const char* _get_hw_device_type(us_hwenc_type_e type) {
 	}
 }
 
+// 采样 NV12 Y 分量以检测黑帧（低开销采样）
+static void _log_nv12_luma_sample(const uint8_t *y_plane, int y_linesize, int width, int height, const char *stage) {
+	if (!y_plane || y_linesize == 0 || width <= 0 || height <= 0) {
+		US_LOG_DEBUG("HWENC: %s NV12 luma sample skipped (invalid params)", stage ? stage : "unknown");
+		return;
+	}
+	int step_x = width / 16;
+	int step_y = height / 16;
+	if (step_x < 1) step_x = 1;
+	if (step_y < 1) step_y = 1;
+	int min_y = 255;
+	int max_y = 0;
+	uint64_t sum_y = 0;
+	int samples = 0;
+	for (int y = 0; y < height; y += step_y) {
+		const uint8_t *row = y_plane + y * y_linesize;
+		for (int x = 0; x < width; x += step_x) {
+			int v = row[x];
+			if (v < min_y) min_y = v;
+			if (v > max_y) max_y = v;
+			sum_y += v;
+			samples++;
+		}
+	}
+	double avg_y = samples > 0 ? (double)sum_y / samples : 0.0;
+	US_LOG_DEBUG("HWENC: %s NV12 luma sample: avg=%.1f, min=%d, max=%d, samples=%d",
+		stage ? stage : "unknown", avg_y, min_y, max_y, samples);
+}
+
 // 初始化基于 FFmpeg 的 RKRGA 滤镜图：CPU帧输入 -> scale_rkrga 到 NV12 -> 输出到 sink
 static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt) {
 	if (enc->rkrga_filter_inited) {
@@ -177,6 +206,7 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 	snprintf(args, sizeof(args),
 		"video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
 		enc->width, enc->height, (int)in_fmt, enc->ctx->time_base.num, enc->ctx->time_base.den);
+	US_LOG_DEBUG("HWENC: RKRGA graph buffer args: '%s' (in=%s)", args, av_get_pix_fmt_name(in_fmt));
 
 	const AVFilter *buffersrc = avfilter_get_by_name("buffer");
 	const AVFilter *buffersink = avfilter_get_by_name("buffersink");
@@ -188,36 +218,52 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 
 	int ret = avfilter_graph_create_filter(&enc->filter_src_ctx, buffersrc, "in", args, NULL, enc->filter_graph);
 	if (ret < 0) {
-		US_LOG_ERROR("HWENC: Failed to create buffer src: %d", ret);
+		char errbuf[AV_ERROR_MAX_STRING_SIZE];
+		av_strerror(ret, errbuf, sizeof(errbuf));
+		US_LOG_ERROR("HWENC: Failed to create buffer src: %s", errbuf);
 		return false;
 	}
+	US_LOG_DEBUG("HWENC: RKRGA buffer src created @%p", (void*)enc->filter_src_ctx);
 
 	AVFilterContext *scale_ctx = NULL;
 	char scale_args[128];
 	// 输出 NV12 以匹配 RKMPP 期望
 	snprintf(scale_args, sizeof(scale_args), "w=%d:h=%d:format=nv12", enc->width, enc->height);
+	US_LOG_DEBUG("HWENC: RKRGA filter args: '%s'", scale_args);
 	ret = avfilter_graph_create_filter(&scale_ctx, scale_rkrga, "scale_rkrga", scale_args, NULL, enc->filter_graph);
 	if (ret < 0) {
-		US_LOG_ERROR("HWENC: Failed to create scale_rkrga: %d", ret);
+		char errbuf[AV_ERROR_MAX_STRING_SIZE];
+		av_strerror(ret, errbuf, sizeof(errbuf));
+		US_LOG_ERROR("HWENC: Failed to create scale_rkrga: %s", errbuf);
 		return false;
 	}
+	US_LOG_DEBUG("HWENC: RKRGA scale filter created @%p", (void*)scale_ctx);
 
 	ret = avfilter_graph_create_filter(&enc->filter_sink_ctx, buffersink, "out", NULL, NULL, enc->filter_graph);
 	if (ret < 0) {
-		US_LOG_ERROR("HWENC: Failed to create buffer sink: %d", ret);
+		char errbuf[AV_ERROR_MAX_STRING_SIZE];
+		av_strerror(ret, errbuf, sizeof(errbuf));
+		US_LOG_ERROR("HWENC: Failed to create buffer sink: %s", errbuf);
 		return false;
 	}
+	US_LOG_DEBUG("HWENC: RKRGA buffer sink created @%p", (void*)enc->filter_sink_ctx);
 
 	ret = avfilter_link(enc->filter_src_ctx, 0, scale_ctx, 0);
 	if (ret >= 0) ret = avfilter_link(scale_ctx, 0, enc->filter_sink_ctx, 0);
 	if (ret < 0) {
-		US_LOG_ERROR("HWENC: Failed to link filter graph: %d", ret);
+		char errbuf[AV_ERROR_MAX_STRING_SIZE];
+		av_strerror(ret, errbuf, sizeof(errbuf));
+		US_LOG_ERROR("HWENC: Failed to link filter graph: %s", errbuf);
 		return false;
 	}
+	US_LOG_DEBUG("HWENC: RKRGA filter graph linked (src@%p -> scale@%p -> sink@%p)",
+		(void*)enc->filter_src_ctx, (void*)scale_ctx, (void*)enc->filter_sink_ctx);
 
 	ret = avfilter_graph_config(enc->filter_graph, NULL);
 	if (ret < 0) {
-		US_LOG_ERROR("HWENC: Failed to config filter graph: %d", ret);
+		char errbuf[AV_ERROR_MAX_STRING_SIZE];
+		av_strerror(ret, errbuf, sizeof(errbuf));
+		US_LOG_ERROR("HWENC: Failed to config filter graph: %s", errbuf);
 		return false;
 	}
 
@@ -854,6 +900,13 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		return US_HWENC_ERROR_FORMAT_UNSUPPORTED;
 	}
 
+	US_LOG_DEBUG("HWENC: Convert start encoder=%s in=%s out=%s size=%dx%d src_stride=%d uv_stride=%d",
+		us_hwenc_type_to_string(encoder->type),
+		av_get_pix_fmt_name(input_format),
+		av_get_pix_fmt_name(output_format),
+		encoder->width, encoder->height,
+		src_linesize[0], src_linesize[1]);
+
 	// 软件缩放器将仅在需要 sws_scale 时按需创建
 
 	// 准备输入数据
@@ -929,7 +982,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 
 	if (!converted_via_rga && input_format == output_format && input_format == AV_PIX_FMT_NV12) {
 		// NV12->NV12直接拷贝优化，避免不必要的格式转换
-		US_LOG_DEBUG("HWENC: Using direct copy for NV12->NV12");
+		US_LOG_DEBUG("HWENC: Using direct copy for NV12->NV12 (src_y_stride=%d, src_uv_stride=%d, dst_y_stride=%d, dst_uv_stride=%d)",
+			src_linesize[0], src_linesize[1], yuv_frame->linesize[0], yuv_frame->linesize[1]);
 		
 		// 拷贝Y平面
 		const uint8_t *src_y = src_data[0];
@@ -948,11 +1002,17 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 			src_uv += src_linesize[1];
 			dst_uv += yuv_frame->linesize[1];
 		}
+		_log_nv12_luma_sample(yuv_frame->data[0], yuv_frame->linesize[0], encoder->width, encoder->height, "post-copy");
 	} else if (!converted_via_rga) {
 		// 尝试使用 FFmpeg 的 RKRGA 滤镜进行加速（CPU 帧 -> scale_rkrga -> NV12）
 		if (encoder->type == US_HWENC_RKMPP) {
 			if ((input_format == AV_PIX_FMT_YUYV422 || input_format == AV_PIX_FMT_RGB24 || input_format == AV_PIX_FMT_BGR24)
 			    && output_format == AV_PIX_FMT_NV12) {
+				US_LOG_DEBUG("HWENC: Try RKRGA path in=%s out=%s inited=%d prev_in=%s (%dx%d->%dx%d)",
+					av_get_pix_fmt_name(input_format), av_get_pix_fmt_name(output_format),
+					encoder->rkrga_filter_inited,
+					av_get_pix_fmt_name(encoder->rkrga_in_pix_fmt),
+					encoder->rkrga_w, encoder->rkrga_h, encoder->width, encoder->height);
 				if (!encoder->rkrga_filter_inited || encoder->rkrga_in_pix_fmt != input_format
 				    || encoder->rkrga_w != encoder->width || encoder->rkrga_h != encoder->height) {
 					if (!_init_rkrga_filter(encoder, input_format)) {
@@ -971,6 +1031,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 						src_frame->data[1] = (uint8_t *)src_data[1];
 						src_frame->linesize[1] = src_linesize[1];
 						// 向滤镜图推送
+						US_LOG_DEBUG("HWENC: RKRGA push src frame (in=%s y_stride=%d uv_stride=%d)",
+							av_get_pix_fmt_name(input_format), src_linesize[0], src_linesize[1]);
 						int fr = av_buffersrc_add_frame_flags(encoder->filter_src_ctx, src_frame, AV_BUFFERSRC_FLAG_KEEP_REF);
 						if (fr >= 0) {
 							AVFrame *filt = av_frame_alloc();
@@ -978,6 +1040,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 								int gr = av_buffersink_get_frame(encoder->filter_sink_ctx, filt);
 								if (gr >= 0 && filt->format == AV_PIX_FMT_NV12 && filt->width == encoder->width && filt->height == encoder->height) {
 									// 拷贝到 yuv_frame
+									US_LOG_DEBUG("HWENC: RKRGA got frame (fmt=%s y_stride=%d uv_stride=%d) -> copy to dst",
+										av_get_pix_fmt_name(filt->format), filt->linesize[0], filt->linesize[1]);
 									for (int y = 0; y < encoder->height; y++) {
 										memcpy(yuv_frame->data[0] + y * yuv_frame->linesize[0], filt->data[0] + y * filt->linesize[0], encoder->width);
 									}
@@ -985,9 +1049,25 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 										memcpy(yuv_frame->data[1] + y * yuv_frame->linesize[1], filt->data[1] + y * filt->linesize[1], encoder->width);
 									}
 									converted_via_rga = true;
+									_log_nv12_luma_sample(yuv_frame->data[0], yuv_frame->linesize[0], encoder->width, encoder->height, "post-rkrga");
+								}
+								else {
+									if (gr < 0) {
+										char errbuf[AV_ERROR_MAX_STRING_SIZE];
+										av_strerror(gr, errbuf, sizeof(errbuf));
+										US_LOG_ERROR("HWENC: RKRGA sink get frame failed: %s", errbuf);
+									} else {
+										US_LOG_ERROR("HWENC: RKRGA sink got unexpected frame (fmt=%s %dx%d)",
+											av_get_pix_fmt_name(filt->format), filt->width, filt->height);
+									}
 								}
 								av_frame_free(&filt);
 							}
+						}
+						else {
+							char errbuf[AV_ERROR_MAX_STRING_SIZE];
+							av_strerror(fr, errbuf, sizeof(errbuf));
+							US_LOG_ERROR("HWENC: RKRGA push src failed: %s", errbuf);
 						}
 						av_frame_free(&src_frame);
 					}
@@ -995,7 +1075,11 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 			}
 		}
 
-        // 使用sws_scale进行格式转换（按需创建 scaler）
+		// 使用sws_scale进行格式转换（按需创建 scaler）
+		if (!converted_via_rga) {
+			US_LOG_DEBUG("HWENC: Using sws_scale fallback (converted_via_rga=%d, in=%s, out=%s)",
+				converted_via_rga, av_get_pix_fmt_name(input_format), av_get_pix_fmt_name(output_format));
+		}
         if (!encoder->sws_ctx) {
             encoder->sws_ctx = sws_getContext(
                 encoder->width, encoder->height, input_format,
@@ -1016,6 +1100,7 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
             src_data, src_linesize,
             0, encoder->height,
             yuv_frame->data, yuv_frame->linesize);
+		_log_nv12_luma_sample(yuv_frame->data[0], yuv_frame->linesize[0], encoder->width, encoder->height, "post-sws");
     }
 
 	// 设置帧时间戳
