@@ -113,6 +113,12 @@ typedef struct {
 	
 	// 性能统计
 	uint64_t total_encode_time_us;
+	
+	// 异步编码队列 (生产者-消费者模式)
+	void *async_queue;           // 异步编码队列指针
+	bool async_mode;             // 是否启用异步模式
+	pthread_t encode_thread;     // 编码工作线程
+	bool encode_thread_started;  // 编码线程是否已启动
 } us_ffmpeg_hwenc_s;
 
 // 函数声明
@@ -125,6 +131,13 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
                                          const us_frame_s *src,
                                          us_frame_s *dest,
                                          bool force_key);
+
+// 异步编码接口
+us_hwenc_error_e us_ffmpeg_hwenc_enable_async(us_ffmpeg_hwenc_s *encoder);
+us_hwenc_error_e us_ffmpeg_hwenc_compress_async(us_ffmpeg_hwenc_s *encoder,
+                                               const us_frame_s *src,
+                                               us_frame_s *dest,
+                                               bool force_key);
 
 us_hwenc_error_e us_ffmpeg_hwenc_reset(us_ffmpeg_hwenc_s *encoder);
 

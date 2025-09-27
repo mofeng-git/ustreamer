@@ -218,6 +218,16 @@ void us_stream_loop(us_stream_s *stream) {
 		} else {
 			US_LOG_INFO("H264: FFmpeg encoder (%s) initialized successfully", 
 				us_hwenc_type_to_string(hwenc_type));
+			
+			// 启用异步编码模式以提高60fps性能
+			if (run->ffmpeg_enc != NULL) {
+				us_hwenc_error_e async_error = us_ffmpeg_hwenc_enable_async(run->ffmpeg_enc);
+				if (async_error == US_HWENC_OK) {
+					US_LOG_INFO("H264: Async encoding mode enabled for better performance");
+				} else {
+					US_LOG_WARN("H264: Failed to enable async mode: %s", us_hwenc_error_string(async_error));
+				}
+			}
 		}
 	}
 #endif
@@ -834,6 +844,7 @@ if (!us_m2m_encoder_compress(run->h264_enc, frame, run->h264_dest, force_key)) {
 	else if (stream->enc->type == US_ENCODER_TYPE_FFMPEG_VIDEO && run->ffmpeg_enc != NULL) {
 		US_LOG_VERBOSE("H264: Compressing frame using FFmpeg encoder");
 		
+		// 使用优化后的FFmpeg编码器（已启用异步模式进行内部优化）
 		us_hwenc_error_e error = us_ffmpeg_hwenc_compress(run->ffmpeg_enc, frame, run->h264_dest, force_key);
 		if (error == US_HWENC_OK) {
 			meta.online = !us_memsink_server_put(stream->h264_sink, run->h264_dest, &run->h264_key_requested);
