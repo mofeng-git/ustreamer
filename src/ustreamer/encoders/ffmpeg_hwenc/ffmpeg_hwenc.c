@@ -243,10 +243,6 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 		}
 		US_LOG_INFO("HWENC: DRM hwdevice created for RKRGA");
 	}
-	if (!enc->filter_graph->hw_device_ctx) {
-		enc->filter_graph->hw_device_ctx = av_buffer_ref(enc->hw_device_ctx);
-		US_LOG_DEBUG("HWENC: filter_graph bound to hw_device_ctx %p", (void*)enc->filter_graph->hw_device_ctx);
-	}
 
 	int ret = avfilter_graph_create_filter(&enc->filter_src_ctx, buffersrc, "in", args, NULL, enc->filter_graph);
 	if (ret < 0) {
@@ -308,6 +304,14 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 		return false;
 	}
 	US_LOG_DEBUG("HWENC: hwupload created @%p", (void*)hwupload_ctx);
+
+	// 为 hwupload 设置硬件设备上下文
+	hwupload_ctx->hw_device_ctx = av_buffer_ref(enc->hw_device_ctx);
+	if (!hwupload_ctx->hw_device_ctx) {
+		US_LOG_ERROR("HWENC: Failed to ref hw_device_ctx for hwupload");
+		return false;
+	}
+	US_LOG_DEBUG("HWENC: hwupload hw_device_ctx set");
 
 	ret = avfilter_graph_create_filter(&hwdownload_ctx, hwdownload, "hwdownload", NULL, NULL, enc->filter_graph);
 	if (ret < 0) {
