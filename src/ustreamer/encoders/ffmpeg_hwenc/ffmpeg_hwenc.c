@@ -211,38 +211,13 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 	const AVFilter *buffersrc = avfilter_get_by_name("buffer");
 	const AVFilter *buffersink = avfilter_get_by_name("buffersink");
 	const AVFilter *scale_rkrga = avfilter_get_by_name("scale_rkrga");
-	const AVFilter *format_filter = avfilter_get_by_name("format");
-	const AVFilter *hwupload = avfilter_get_by_name("hwupload");
-	const AVFilter *hwdownload = avfilter_get_by_name("hwdownload");
 	if (!buffersrc || !buffersink || !scale_rkrga) {
 		US_LOG_ERROR("HWENC: Required filters not found (need buffer, buffersink, scale_rkrga)");
 		return false;
 	}
-	if (!format_filter) {
-		US_LOG_ERROR("HWENC: Required filter not found: format");
-		return false;
-	}
-	if (!hwupload || !hwdownload) {
-		US_LOG_ERROR("HWENC: Required filters not found: hwupload/hwdownload");
-		return false;
-	}
 
-	// 对 RKRGA，准备 DRM 设备用于 hwupload/hwdownload
-	if (!enc->hw_device_ctx) {
-		enum AVHWDeviceType devtype = av_hwdevice_find_type_by_name("drm");
-		if (devtype == AV_HWDEVICE_TYPE_NONE) {
-			US_LOG_ERROR("HWENC: DRM device type not found for RKRGA hwupload");
-			return false;
-		}
-		int dret = av_hwdevice_ctx_create(&enc->hw_device_ctx, devtype, NULL, NULL, 0);
-		if (dret < 0) {
-			char errbuf[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(dret, errbuf, sizeof(errbuf));
-			US_LOG_ERROR("HWENC: Failed to create DRM hwdevice for RKRGA: %s", errbuf);
-			return false;
-		}
-		US_LOG_INFO("HWENC: DRM hwdevice created for RKRGA");
-	}
+	// RKRGA 滤镜通常不需要额外的硬件设备上下文，它是 CPU 滤镜
+	// 移除 DRM 设备创建，简化滤镜链
 
 	int ret = avfilter_graph_create_filter(&enc->filter_src_ctx, buffersrc, "in", args, NULL, enc->filter_graph);
 	if (ret < 0) {
@@ -254,10 +229,6 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 	US_LOG_DEBUG("HWENC: RKRGA buffer src created @%p", (void*)enc->filter_src_ctx);
 
 	AVFilterContext *scale_ctx = NULL;
-	AVFilterContext *format_in_ctx = NULL;
-	AVFilterContext *format_out_ctx = NULL;
-	AVFilterContext *hwupload_ctx = NULL;
-	AVFilterContext *hwdownload_ctx = NULL;
 	char scale_args[128];
 	// 输出 NV12 以匹配 RKMPP 期望
 	snprintf(scale_args, sizeof(scale_args), "w=%d:h=%d:format=nv12", enc->width, enc->height);
@@ -271,57 +242,6 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 	}
 	US_LOG_DEBUG("HWENC: RKRGA scale filter created @%p", (void*)scale_ctx);
 
-	// format(in) 确保输入像素格式固定，避免 auto_scale 插入
-	char fmt_in_args[64];
-	snprintf(fmt_in_args, sizeof(fmt_in_args), "pix_fmts=%s", av_get_pix_fmt_name(in_fmt));
-	ret = avfilter_graph_create_filter(&format_in_ctx, format_filter, "format_in", fmt_in_args, NULL, enc->filter_graph);
-	if (ret < 0) {
-		char errbuf[AV_ERROR_MAX_STRING_SIZE];
-		av_strerror(ret, errbuf, sizeof(errbuf));
-		US_LOG_ERROR("HWENC: Failed to create input format filter: %s", errbuf);
-		return false;
-	}
-	US_LOG_DEBUG("HWENC: format_in created @%p args='%s'", (void*)format_in_ctx, fmt_in_args);
-
-	// format(out) 将输出固定为 NV12（CPU 可访问）
-	char fmt_out_args[64];
-	snprintf(fmt_out_args, sizeof(fmt_out_args), "pix_fmts=%s", av_get_pix_fmt_name(AV_PIX_FMT_NV12));
-	ret = avfilter_graph_create_filter(&format_out_ctx, format_filter, "format_out", fmt_out_args, NULL, enc->filter_graph);
-	if (ret < 0) {
-		char errbuf[AV_ERROR_MAX_STRING_SIZE];
-		av_strerror(ret, errbuf, sizeof(errbuf));
-		US_LOG_ERROR("HWENC: Failed to create output format filter: %s", errbuf);
-		return false;
-	}
-	US_LOG_DEBUG("HWENC: format_out created @%p args='%s'", (void*)format_out_ctx, fmt_out_args);
-
-	// hwupload / hwdownload 负责 CPU<->DRM 映射
-	ret = avfilter_graph_create_filter(&hwupload_ctx, hwupload, "hwupload", NULL, NULL, enc->filter_graph);
-	if (ret < 0) {
-		char errbuf[AV_ERROR_MAX_STRING_SIZE];
-		av_strerror(ret, errbuf, sizeof(errbuf));
-		US_LOG_ERROR("HWENC: Failed to create hwupload: %s", errbuf);
-		return false;
-	}
-	US_LOG_DEBUG("HWENC: hwupload created @%p", (void*)hwupload_ctx);
-
-	// 为 hwupload 设置硬件设备上下文
-	hwupload_ctx->hw_device_ctx = av_buffer_ref(enc->hw_device_ctx);
-	if (!hwupload_ctx->hw_device_ctx) {
-		US_LOG_ERROR("HWENC: Failed to ref hw_device_ctx for hwupload");
-		return false;
-	}
-	US_LOG_DEBUG("HWENC: hwupload hw_device_ctx set");
-
-	ret = avfilter_graph_create_filter(&hwdownload_ctx, hwdownload, "hwdownload", NULL, NULL, enc->filter_graph);
-	if (ret < 0) {
-		char errbuf[AV_ERROR_MAX_STRING_SIZE];
-		av_strerror(ret, errbuf, sizeof(errbuf));
-		US_LOG_ERROR("HWENC: Failed to create hwdownload: %s", errbuf);
-		return false;
-	}
-	US_LOG_DEBUG("HWENC: hwdownload created @%p", (void*)hwdownload_ctx);
-
 	ret = avfilter_graph_create_filter(&enc->filter_sink_ctx, buffersink, "out", NULL, NULL, enc->filter_graph);
 	if (ret < 0) {
 		char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -331,31 +251,17 @@ static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt
 	}
 	US_LOG_DEBUG("HWENC: RKRGA buffer sink created @%p", (void*)enc->filter_sink_ctx);
 
-	// 限定 sink 像素格式为 NV12，进一步避免自动插入
-	enum AVPixelFormat sink_pix_fmts[] = { AV_PIX_FMT_NV12, AV_PIX_FMT_NONE };
-	ret = av_opt_set_int_list(enc->filter_sink_ctx, "pix_fmts", sink_pix_fmts, AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
-	if (ret < 0) {
-		char errbuf[AV_ERROR_MAX_STRING_SIZE];
-		av_strerror(ret, errbuf, sizeof(errbuf));
-		US_LOG_ERROR("HWENC: Failed to set sink pix_fmts NV12: %s", errbuf);
-		return false;
-	}
-
-	// Link: buffer -> format_in -> hwupload -> scale_rkrga -> hwdownload -> format_out -> buffersink
-	ret = avfilter_link(enc->filter_src_ctx, 0, format_in_ctx, 0);
-	if (ret >= 0) ret = avfilter_link(format_in_ctx, 0, hwupload_ctx, 0);
-	if (ret >= 0) ret = avfilter_link(hwupload_ctx, 0, scale_ctx, 0);
-	if (ret >= 0) ret = avfilter_link(scale_ctx, 0, hwdownload_ctx, 0);
-	if (ret >= 0) ret = avfilter_link(hwdownload_ctx, 0, format_out_ctx, 0);
-	if (ret >= 0) ret = avfilter_link(format_out_ctx, 0, enc->filter_sink_ctx, 0);
+	// 简化链接：buffer -> scale_rkrga -> buffersink
+	ret = avfilter_link(enc->filter_src_ctx, 0, scale_ctx, 0);
+	if (ret >= 0) ret = avfilter_link(scale_ctx, 0, enc->filter_sink_ctx, 0);
 	if (ret < 0) {
 		char errbuf[AV_ERROR_MAX_STRING_SIZE];
 		av_strerror(ret, errbuf, sizeof(errbuf));
 		US_LOG_ERROR("HWENC: Failed to link filter graph: %s", errbuf);
 		return false;
 	}
-	US_LOG_DEBUG("HWENC: RKRGA filter graph linked (src@%p -> fmt_in@%p -> hwupload@%p -> scale@%p -> hwdownload@%p -> fmt_out@%p -> sink@%p)",
-		(void*)enc->filter_src_ctx, (void*)format_in_ctx, (void*)hwupload_ctx, (void*)scale_ctx, (void*)hwdownload_ctx, (void*)format_out_ctx, (void*)enc->filter_sink_ctx);
+	US_LOG_DEBUG("HWENC: RKRGA filter graph linked (src@%p -> scale@%p -> sink@%p)",
+		(void*)enc->filter_src_ctx, (void*)scale_ctx, (void*)enc->filter_sink_ctx);
 
 	ret = avfilter_graph_config(enc->filter_graph, NULL);
 	if (ret < 0) {
