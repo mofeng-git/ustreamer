@@ -900,13 +900,6 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		return US_HWENC_ERROR_FORMAT_UNSUPPORTED;
 	}
 
-	US_LOG_DEBUG("HWENC: Convert start encoder=%s in=%s out=%s size=%dx%d src_stride=%d uv_stride=%d",
-		us_hwenc_type_to_string(encoder->type),
-		av_get_pix_fmt_name(input_format),
-		av_get_pix_fmt_name(output_format),
-		encoder->width, encoder->height,
-		src_linesize[0], src_linesize[1]);
-
 	// 软件缩放器将仅在需要 sws_scale 时按需创建
 
 	// 准备输入数据
@@ -927,6 +920,13 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		src_data[1] = src->data + src->stride * encoder->height;
 		src_linesize[1] = (int)src->stride * 2;
 	}
+
+	US_LOG_DEBUG("HWENC: Convert start encoder=%s in=%s out=%s size=%dx%d src_stride=%d uv_stride=%d",
+		us_hwenc_type_to_string(encoder->type),
+		av_get_pix_fmt_name(input_format),
+		av_get_pix_fmt_name(output_format),
+		encoder->width, encoder->height,
+		src_linesize[0], src_linesize[1]);
 
 	// 分配软件帧缓冲区
 	AVFrame *yuv_frame = av_frame_alloc();
