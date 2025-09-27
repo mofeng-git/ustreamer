@@ -52,6 +52,8 @@ struct AVFrame;
 struct AVPacket;
 struct SwsContext;
 struct AVBufferRef;
+struct AVFilterGraph;
+struct AVFilterContext;
 
 // FFmpeg硬件编码器结构体
 typedef struct {
@@ -62,6 +64,14 @@ typedef struct {
 	struct SwsContext *sws_ctx;
 	struct AVBufferRef *hw_device_ctx;
 	struct AVBufferRef *hw_frames_ctx;
+	// 过滤器（RKRGA）
+	struct AVFilterGraph *filter_graph;
+	struct AVFilterContext *filter_src_ctx;
+	struct AVFilterContext *filter_sink_ctx;
+	bool rkrga_filter_inited;
+	int rkrga_in_pix_fmt;
+	int rkrga_w;
+	int rkrga_h;
 	
 	// 编码器信息
 	us_hwenc_type_e type;

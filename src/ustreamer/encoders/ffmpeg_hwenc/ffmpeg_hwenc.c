@@ -13,10 +13,15 @@
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 #ifdef WITH_VAAPI
 #include <libavutil/hwcontext_vaapi.h>
 #endif
 #endif
+
+// 已弃用：直接使用 RGA API 的路径改为通过 FFmpeg 的 scale_rkrga 滤镜
 
 #include "../../../libs/frame.h"
 #include "../../../libs/logging.h"
@@ -156,6 +161,74 @@ static const char* _get_hw_device_type(us_hwenc_type_e type) {
 	}
 }
 
+// 初始化基于 FFmpeg 的 RKRGA 滤镜图：CPU帧输入 -> scale_rkrga 到 NV12 -> 输出到 sink
+static bool _init_rkrga_filter(us_ffmpeg_hwenc_s *enc, enum AVPixelFormat in_fmt) {
+	if (enc->rkrga_filter_inited) {
+		return true;
+	}
+
+	enc->filter_graph = avfilter_graph_alloc();
+	if (!enc->filter_graph) {
+		US_LOG_ERROR("HWENC: Failed to alloc filter graph");
+		return false;
+	}
+
+	char args[256];
+	snprintf(args, sizeof(args),
+		"video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=1/1",
+		enc->width, enc->height, (int)in_fmt, enc->ctx->time_base.num, enc->ctx->time_base.den);
+
+	const AVFilter *buffersrc = avfilter_get_by_name("buffer");
+	const AVFilter *buffersink = avfilter_get_by_name("buffersink");
+	const AVFilter *scale_rkrga = avfilter_get_by_name("scale_rkrga");
+	if (!buffersrc || !buffersink || !scale_rkrga) {
+		US_LOG_ERROR("HWENC: Required filters not found (need buffer, buffersink, scale_rkrga)");
+		return false;
+	}
+
+	int ret = avfilter_graph_create_filter(&enc->filter_src_ctx, buffersrc, "in", args, NULL, enc->filter_graph);
+	if (ret < 0) {
+		US_LOG_ERROR("HWENC: Failed to create buffer src: %d", ret);
+		return false;
+	}
+
+	AVFilterContext *scale_ctx = NULL;
+	char scale_args[128];
+	// 输出 NV12 以匹配 RKMPP 期望
+	snprintf(scale_args, sizeof(scale_args), "w=%d:h=%d:format=nv12", enc->width, enc->height);
+	ret = avfilter_graph_create_filter(&scale_ctx, scale_rkrga, "scale_rkrga", scale_args, NULL, enc->filter_graph);
+	if (ret < 0) {
+		US_LOG_ERROR("HWENC: Failed to create scale_rkrga: %d", ret);
+		return false;
+	}
+
+	ret = avfilter_graph_create_filter(&enc->filter_sink_ctx, buffersink, "out", NULL, NULL, enc->filter_graph);
+	if (ret < 0) {
+		US_LOG_ERROR("HWENC: Failed to create buffer sink: %d", ret);
+		return false;
+	}
+
+	ret = avfilter_link(enc->filter_src_ctx, 0, scale_ctx, 0);
+	if (ret >= 0) ret = avfilter_link(scale_ctx, 0, enc->filter_sink_ctx, 0);
+	if (ret < 0) {
+		US_LOG_ERROR("HWENC: Failed to link filter graph: %d", ret);
+		return false;
+	}
+
+	ret = avfilter_graph_config(enc->filter_graph, NULL);
+	if (ret < 0) {
+		US_LOG_ERROR("HWENC: Failed to config filter graph: %d", ret);
+		return false;
+	}
+
+	enc->rkrga_filter_inited = true;
+	enc->rkrga_in_pix_fmt = (int)in_fmt;
+	enc->rkrga_w = enc->width;
+	enc->rkrga_h = enc->height;
+	US_LOG_INFO("HWENC: RKRGA filter initialized for %dx%d %s -> NV12", enc->width, enc->height, av_get_pix_fmt_name(in_fmt));
+	return true;
+}
+
 // 获取编码器名称
 const char* us_ffmpeg_hwenc_get_codec_name(us_hwenc_type_e type) {
 	switch (type) {
@@ -170,6 +243,8 @@ const char* us_ffmpeg_hwenc_get_codec_name(us_hwenc_type_e type) {
 		default: return "";
 	}
 }
+
+// （无实现）
 
 // 创建编码器的核心实现
 us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
@@ -202,6 +277,13 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 	enc->type = type;
 	enc->width = width;
 	enc->height = height;
+	enc->filter_graph = NULL;
+	enc->filter_src_ctx = NULL;
+	enc->filter_sink_ctx = NULL;
+	enc->rkrga_filter_inited = false;
+	enc->rkrga_in_pix_fmt = AV_PIX_FMT_NONE;
+	enc->rkrga_w = 0;
+	enc->rkrga_h = 0;
 	enc->bitrate_kbps = bitrate_kbps;
 	enc->gop_size = gop_size;
 	strncpy(enc->codec_name, us_ffmpeg_hwenc_get_codec_name(type), sizeof(enc->codec_name) - 1);
@@ -772,23 +854,7 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		return US_HWENC_ERROR_FORMAT_UNSUPPORTED;
 	}
 
-	// 动态创建或更新软件缩放器
-	if (!encoder->sws_ctx) {
-		encoder->sws_ctx = sws_getContext(
-			encoder->width, encoder->height, input_format,
-			encoder->width, encoder->height, output_format,
-			SWS_BILINEAR, NULL, NULL, NULL);
-		
-		if (!encoder->sws_ctx) {
-			pthread_mutex_unlock(&encoder->mutex);
-			US_LOG_ERROR("HWENC: Failed to create software scaler");
-			return US_HWENC_ERROR_MEMORY;
-		}
-		
-		US_LOG_DEBUG("HWENC: Created scaler %s -> %s", 
-		           av_get_pix_fmt_name(input_format),
-		           av_get_pix_fmt_name(output_format));
-	}
+	// 软件缩放器将仅在需要 sws_scale 时按需创建
 
 	// 准备输入数据
 	const uint8_t *src_data[4] = {src->data, NULL, NULL, NULL};
@@ -858,7 +924,10 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	}
 
 	// 格式转换或直接拷贝
-	if (input_format == output_format && input_format == AV_PIX_FMT_NV12) {
+	bool converted_via_rga = false;
+    // 直接 RGA API 路径已移除，改用 FFmpeg scale_rkrga 滤镜
+
+	if (!converted_via_rga && input_format == output_format && input_format == AV_PIX_FMT_NV12) {
 		// NV12->NV12直接拷贝优化，避免不必要的格式转换
 		US_LOG_DEBUG("HWENC: Using direct copy for NV12->NV12");
 		
@@ -879,13 +948,75 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 			src_uv += src_linesize[1];
 			dst_uv += yuv_frame->linesize[1];
 		}
-	} else {
-		// 使用sws_scale进行格式转换
-		sws_scale(encoder->sws_ctx,
-			src_data, src_linesize,
-			0, encoder->height,
-			yuv_frame->data, yuv_frame->linesize);
-	}
+	} else if (!converted_via_rga) {
+		// 尝试使用 FFmpeg 的 RKRGA 滤镜进行加速（CPU 帧 -> scale_rkrga -> NV12）
+		if (encoder->type == US_HWENC_RKMPP) {
+			if ((input_format == AV_PIX_FMT_YUYV422 || input_format == AV_PIX_FMT_RGB24 || input_format == AV_PIX_FMT_BGR24)
+			    && output_format == AV_PIX_FMT_NV12) {
+				if (!encoder->rkrga_filter_inited || encoder->rkrga_in_pix_fmt != input_format
+				    || encoder->rkrga_w != encoder->width || encoder->rkrga_h != encoder->height) {
+					if (!_init_rkrga_filter(encoder, input_format)) {
+						US_LOG_INFO("HWENC: RKRGA filter init failed, fallback to sws_scale");
+					} 
+				}
+				if (encoder->rkrga_filter_inited) {
+					AVFrame *src_frame = av_frame_alloc();
+					if (src_frame) {
+						src_frame->format = input_format;
+						src_frame->width = encoder->width;
+						src_frame->height = encoder->height;
+						// 填充源数据指针/步长
+						src_frame->data[0] = (uint8_t *)src_data[0];
+						src_frame->linesize[0] = src_linesize[0];
+						src_frame->data[1] = (uint8_t *)src_data[1];
+						src_frame->linesize[1] = src_linesize[1];
+						// 向滤镜图推送
+						int fr = av_buffersrc_add_frame_flags(encoder->filter_src_ctx, src_frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+						if (fr >= 0) {
+							AVFrame *filt = av_frame_alloc();
+							if (filt) {
+								int gr = av_buffersink_get_frame(encoder->filter_sink_ctx, filt);
+								if (gr >= 0 && filt->format == AV_PIX_FMT_NV12 && filt->width == encoder->width && filt->height == encoder->height) {
+									// 拷贝到 yuv_frame
+									for (int y = 0; y < encoder->height; y++) {
+										memcpy(yuv_frame->data[0] + y * yuv_frame->linesize[0], filt->data[0] + y * filt->linesize[0], encoder->width);
+									}
+									for (int y = 0; y < encoder->height / 2; y++) {
+										memcpy(yuv_frame->data[1] + y * yuv_frame->linesize[1], filt->data[1] + y * filt->linesize[1], encoder->width);
+									}
+									converted_via_rga = true;
+								}
+								av_frame_free(&filt);
+							}
+						}
+						av_frame_free(&src_frame);
+					}
+				}
+			}
+		}
+
+        // 使用sws_scale进行格式转换（按需创建 scaler）
+        if (!encoder->sws_ctx) {
+            encoder->sws_ctx = sws_getContext(
+                encoder->width, encoder->height, input_format,
+                encoder->width, encoder->height, output_format,
+                SWS_BILINEAR, NULL, NULL, NULL);
+            if (!encoder->sws_ctx) {
+                av_frame_free(&yuv_frame);
+                pthread_mutex_unlock(&encoder->mutex);
+                US_LOG_ERROR("HWENC: Failed to create software scaler");
+                return US_HWENC_ERROR_MEMORY;
+            }
+            US_LOG_DEBUG("HWENC: Created scaler %s -> %s",
+                av_get_pix_fmt_name(input_format),
+                av_get_pix_fmt_name(output_format));
+        }
+
+        sws_scale(encoder->sws_ctx,
+            src_data, src_linesize,
+            0, encoder->height,
+            yuv_frame->data, yuv_frame->linesize);
+    }
 
 	// 设置帧时间戳
 	yuv_frame->pts = encoder->frame_number;

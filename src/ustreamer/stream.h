@@ -36,7 +36,7 @@
 #ifdef WITH_FFMPEG
 #	include "encoders/ffmpeg_hwenc/ffmpeg_hwenc.h"
 #endif
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 #	include "../libs/drm/drm.h"
 #endif
 
@@ -48,7 +48,7 @@
 #endif
 
 typedef struct {
-#	ifdef WITH_V4P
+#	if defined(WITH_DRM) || defined(WITH_V4P)
 	atomic_bool		drm_live;
 	us_fpsi_s		*drm_fpsi;
 #	endif
@@ -108,7 +108,7 @@ typedef struct {
 	bool			h264_hwenc_fallback;
 #	endif
 
-#	ifdef WITH_V4P
+#	if defined(WITH_DRM) || defined(WITH_V4P)
 	us_drm_s		*drm;
 #	endif
 

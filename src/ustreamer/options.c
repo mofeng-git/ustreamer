@@ -107,6 +107,11 @@ enum _US_OPT_VALUES {
 #	endif
 #	undef ADD_SINK
 
+#	if defined(WITH_DRM) || defined(WITH_V4P)
+	_O_DRM_DEVICE,
+	_O_DRM_PORT,
+#	endif
+
 #	ifdef WITH_V4P
 	_O_V4P,
 #	endif
@@ -222,6 +227,11 @@ static const struct option _LONG_OPTS[] = {
 	{"sink-rm",					no_argument,		NULL,	_O_JPEG_SINK_RM},
 	{"sink-client-ttl",			required_argument,	NULL,	_O_JPEG_SINK_CLIENT_TTL},
 	{"sink-timeout",			required_argument,	NULL,	_O_JPEG_SINK_TIMEOUT},
+
+#	if defined(WITH_DRM) || defined(WITH_V4P)
+	{"drm-device",				required_argument,	NULL,	_O_DRM_DEVICE},
+	{"drm-port",				required_argument,	NULL,	_O_DRM_PORT},
+#	endif
 
 #	ifdef WITH_V4P
 	{"v4p",						no_argument,		NULL,	_O_V4P},
@@ -484,10 +494,32 @@ int options_parse(us_options_s *options, us_capture_s *cap, us_encoder_s *enc, u
 			case _O_H264_GOP:				OPT_NUMBER("--h264-gop", stream->h264_gop, 0, 60, 0);
 			case _O_H264_M2M_DEVICE:		OPT_SET(stream->h264_m2m_path, optarg);
 
+#			if defined(WITH_DRM) || defined(WITH_V4P)
+			case _O_DRM_DEVICE:
+				if (options->drm == NULL) {
+					options->drm = us_drm_init();
+					stream->drm = options->drm;
+				}
+				US_DELETE(options->drm->path, free);
+				options->drm->path = strdup(optarg);
+				options->drm->center_mode = true;
+				break;
+			case _O_DRM_PORT:
+				if (options->drm == NULL) {
+					options->drm = us_drm_init();
+					stream->drm = options->drm;
+				}
+				US_DELETE(options->drm->port, free);
+				options->drm->port = strdup(optarg);
+				break;
+#			endif
+
 #			ifdef WITH_V4P
 			case _O_V4P:
-				options->drm = us_drm_init();
-				stream->drm = options->drm;
+				if (options->drm == NULL) {
+					options->drm = us_drm_init();
+					stream->drm = options->drm;
+				}
 				break;
 #			endif
 
@@ -610,6 +642,11 @@ static void _features(void) {
 	puts("- WITH_JANUS");
 #	endif
 
+#	ifdef MK_WITH_DRM
+	puts("+ WITH_DRM");
+#	else
+	puts("- WITH_DRM");
+#	endif
 #	ifdef MK_WITH_V4P
 	puts("+ WITH_V4P");
 #	else
@@ -664,7 +701,7 @@ static void _help(FILE *fp, const us_capture_s *cap, const us_encoder_s *enc, co
 	SAY("\nuStreamer - Lightweight and fast MJPEG-HTTP streamer");
 	SAY("═══════════════════════════════════════════════════");
 	SAY("Version: %s; license: GPLv3", US_VERSION);
-	SAY("Copyright (C) 2018-2024 Maxim Devaev <mdevaev@gmail.com>\n");
+	SAY("Copyright (C) 2018-2025 Maxim Devaev | Modified by SilentWind\n");
 	SAY("Capturing options:");
 	SAY("══════════════════");
 	SAY("    -d|--device </dev/path>  ───────────── Path to V4L2 device. Default: %s.\n", cap->path);
@@ -785,6 +822,17 @@ static void _help(FILE *fp, const us_capture_s *cap, const us_encoder_s *enc, co
 	SAY("    --h264-hwenc-fallback  ────────── Always fallback to software encoding if hardware encoding is unavailable.\n");
 	SAY("                                       Default: disabled.\n");
 #	endif
+#	if defined(WITH_DRM) || defined(WITH_V4P)
+	SAY("Direct display options:");
+	SAY("═══════════════════════");
+	SAY("    --drm-device </dev/dri/cardX>  ─ Specify DRM device for centered display output.");
+	SAY("                                    Automatically enables low-priority centered display mode.");
+	SAY("                                    Example: /dev/dri/card1");
+	SAY("    --drm-port <connector>         ─ Specify DRM display connector/port.");
+	SAY("                                    Examples: HDMI-A-1, eDP-1, DP-1");
+	SAY("                                    Default: HDMI-A-2\n");
+#	endif
+
 #	ifdef WITH_V4P
 	SAY("Passthrough options for PiKVM V4:");
 	SAY("═════════════════════════════════");

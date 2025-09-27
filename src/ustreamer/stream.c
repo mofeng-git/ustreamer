@@ -49,7 +49,7 @@
 #	include <x264.h>
 #endif
 
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 #	include "../libs/drm/drm.h"
 #endif
 
@@ -87,7 +87,7 @@ static void *_releaser_thread(void *v_ctx);
 static void *_jpeg_thread(void *v_ctx);
 static void *_raw_thread(void *v_ctx);
 static void *_h264_thread(void *v_ctx);
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void *_drm_thread(void *v_ctx);
 #endif
 
@@ -97,7 +97,7 @@ static bool _stream_has_jpeg_clients_cached(us_stream_s *stream);
 static bool _stream_has_any_clients_cached(us_stream_s *stream);
 static int _stream_init_loop(us_stream_s *stream);
 static void _stream_update_captured_fpsi(us_stream_s *stream, const us_frame_s *frame, bool bump);
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void _stream_drm_ensure_no_signal(us_stream_s *stream);
 #endif
 static void _stream_expose_jpeg(us_stream_s *stream, const us_frame_s *frame);
@@ -109,7 +109,7 @@ static void _stream_check_suicide(us_stream_s *stream);
 us_stream_s *us_stream_init(us_capture_s *cap, us_encoder_s *enc) {
 	us_stream_http_s *http;
 	US_CALLOC(http, 1);
-#	ifdef WITH_V4P
+#	if defined(WITH_DRM) || defined(WITH_V4P)
 	http->drm_fpsi = us_fpsi_init("DRM", true);
 #	endif
 	http->h264_fpsi = us_fpsi_init("H264", true);
@@ -149,7 +149,7 @@ void us_stream_destroy(us_stream_s *stream) {
 	us_fpsi_destroy(stream->run->http->captured_fpsi);
 	US_RING_DELETE_WITH_ITEMS(stream->run->http->jpeg_ring, us_frame_destroy);
 	us_fpsi_destroy(stream->run->http->h264_fpsi);
-#	ifdef WITH_V4P
+#	if defined(WITH_DRM) || defined(WITH_V4P)
 	us_fpsi_destroy(stream->run->http->drm_fpsi);
 #	endif
 	us_blank_destroy(stream->run->blank);
@@ -256,7 +256,7 @@ void us_stream_loop(us_stream_s *stream) {
 		CREATE_WORKER(true, jpeg_ctx, _jpeg_thread, cap->run->n_bufs);
 		CREATE_WORKER((stream->raw_sink != NULL), raw_ctx, _raw_thread, 2);
 		CREATE_WORKER((stream->h264_sink != NULL), h264_ctx, _h264_thread, cap->run->n_bufs);
-#		ifdef WITH_V4P
+#		if defined(WITH_DRM) || defined(WITH_V4P)
 		CREATE_WORKER((stream->drm != NULL), drm_ctx, _drm_thread, cap->run->n_bufs); // cppcheck-suppress assertWithSideEffect
 #		endif
 #		undef CREATE_WORKER
@@ -285,7 +285,7 @@ void us_stream_loop(us_stream_s *stream) {
 			QUEUE_HW(jpeg_ctx);
 			QUEUE_HW(raw_ctx);
 			QUEUE_HW(h264_ctx);
-#			ifdef WITH_V4P
+#			if defined(WITH_DRM) || defined(WITH_V4P)
 			QUEUE_HW(drm_ctx);
 #			endif
 #			undef QUEUE_HW
@@ -310,7 +310,7 @@ void us_stream_loop(us_stream_s *stream) {
 				us_queue_destroy(x_ctx->queue); \
 				free(x_ctx); \
 			}
-#		ifdef WITH_V4P
+#		if defined(WITH_DRM) || defined(WITH_V4P)
 		DELETE_WORKER(drm_ctx);
 #		endif
 		DELETE_WORKER(h264_ctx);
@@ -503,9 +503,15 @@ static void *_h264_thread(void *v_ctx) {
 	return NULL;
 }
 
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void *_drm_thread(void *v_ctx) {
 	US_THREAD_SETTLE("str_drm");
+	
+	// 设置低优先级，确保不影响采集和Web服务
+	if (nice(10) < 0) {
+		US_LOG_PERROR("DRM: Can't set low priority (ignored)");
+	}
+	
 	_worker_context_s *ctx = v_ctx;
 	us_stream_s *stream = ctx->stream;
 
@@ -533,11 +539,18 @@ static void *_drm_thread(void *v_ctx) {
 
 			us_capture_hwbuf_s *hw = _get_latest_hw(ctx->queue);
 			if (hw == NULL) {
+				// 无新帧时短暂等待，避免占用CPU
+				usleep(16666); // ~60fps检查频率
 				continue;
 			}
 
 			if (stream->drm->run->opened == 0) {
-				CHECK(us_drm_expose_dma(stream->drm, hw));
+				// 检查是否启用居中模式
+				if (stream->drm->center_mode) {
+					CHECK(us_drm_expose_centered(stream->drm, hw));
+				} else {
+					CHECK(us_drm_expose_dma(stream->drm, hw));
+				}
 				prev_hw = hw;
 				us_fpsi_meta_s meta = {.online = true}; // Online means live video
 				us_fpsi_update(stream->run->http->drm_fpsi, true, &meta);
@@ -593,7 +606,7 @@ static bool _stream_has_any_clients_cached(us_stream_s *stream) {
 		_stream_has_jpeg_clients_cached(stream)
 		|| (stream->h264_sink != NULL && atomic_load(&stream->h264_sink->has_clients))
 		|| (stream->raw_sink != NULL && atomic_load(&stream->raw_sink->has_clients))
-#		ifdef WITH_V4P
+#		if defined(WITH_DRM) || defined(WITH_V4P)
 		|| (stream->drm != NULL)
 #		endif
 	);
@@ -624,7 +637,7 @@ static int _stream_init_loop(us_stream_s *stream) {
 			stream->enc->type == US_ENCODER_TYPE_M2M_VIDEO
 			|| stream->enc->type == US_ENCODER_TYPE_M2M_IMAGE
 			|| stream->h264_sink != NULL
-#			ifdef WITH_V4P
+#			if defined(WITH_DRM) || defined(WITH_V4P)
 			|| stream->drm != NULL
 #			endif
 		);
@@ -735,7 +748,7 @@ static void _stream_update_captured_fpsi(us_stream_s *stream, const us_frame_s *
 	}
 }
 
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void _stream_drm_ensure_no_signal(us_stream_s *stream) {
 	if (stream->drm == NULL) {
 		return;

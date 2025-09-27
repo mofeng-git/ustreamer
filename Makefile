@@ -17,6 +17,7 @@ R_DESTDIR = $(if $(DESTDIR),$(shell realpath "$(DESTDIR)"),)
 WITH_PYTHON ?= 0
 WITH_JANUS ?= 0
 WITH_V4P ?= 0
+WITH_DRM ?= 0
 WITH_GPIO ?= 0
 WITH_SYSTEMD ?= 0
 WITH_PTHREAD_NP ?= 1
@@ -29,6 +30,7 @@ endef
 MK_WITH_PYTHON = $(call optbool,$(WITH_PYTHON))
 MK_WITH_JANUS = $(call optbool,$(WITH_JANUS))
 MK_WITH_V4P = $(call optbool,$(WITH_V4P))
+MK_WITH_DRM = $(call optbool,$(WITH_DRM))
 MK_WITH_GPIO = $(call optbool,$(WITH_GPIO))
 MK_WITH_SYSTEMD = $(call optbool,$(WITH_SYSTEMD))
 MK_WITH_PTHREAD_NP = $(call optbool,$(WITH_PTHREAD_NP))

@@ -468,7 +468,7 @@ static void _http_callback_state(struct evhttp_request *request, void *v_server)
 		enc_quality
 	);
 
-#	ifdef WITH_V4P
+#	if defined(WITH_DRM) || defined(WITH_V4P)
 	if (stream->drm != NULL) {
 		us_fpsi_meta_s meta;
 		const uint fps = us_fpsi_get(stream->run->http->drm_fpsi, &meta);

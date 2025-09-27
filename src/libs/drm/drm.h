@@ -40,6 +40,13 @@ typedef enum {
 } us_drm_stub_e;
 
 typedef struct {
+	uint src_width, src_height;
+	uint dst_width, dst_height;
+	uint offset_x, offset_y;
+	bool needs_center;
+} us_drm_center_s;
+
+typedef struct {
 	u32		id;
 	u32		handle;
 	u8		*data;
@@ -72,6 +79,7 @@ typedef struct {
 
 	int				once;
 	us_frametext_s	*ft;
+	uint			detected_bpp;	// Auto-detected bits per pixel
 } us_drm_runtime_s;
 
 typedef struct {
@@ -79,6 +87,7 @@ typedef struct {
 	char	*port;
 	uint	timeout;
 	uint	blank_after;
+	bool	center_mode;
 
 	us_drm_runtime_s *run;
 } us_drm_s;
@@ -94,4 +103,5 @@ int us_drm_dpms_power_off(us_drm_s *drm);
 int us_drm_wait_for_vsync(us_drm_s *drm);
 int us_drm_expose_stub(us_drm_s *drm, us_drm_stub_e stub, const us_capture_s *cap);
 int us_drm_expose_dma(us_drm_s *drm, const us_capture_hwbuf_s *hw);
+int us_drm_expose_centered(us_drm_s *drm, const us_capture_hwbuf_s *hw);
 int us_drm_ensure_no_signal(us_drm_s *drm);
