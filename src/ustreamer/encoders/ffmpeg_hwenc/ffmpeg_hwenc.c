@@ -338,13 +338,15 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 		char gop_str[16];
 		snprintf(gop_str, sizeof(gop_str), "%u", gop_size);
 		av_dict_set(&opts, "g", gop_str, 0);                  // GOP大小
-		// QP参数优化 - 提高QP降低质量换取速度
-		av_dict_set(&opts, "qp_init", "28", 0);               // 初始QP值 (提高)
-		av_dict_set(&opts, "qp_min", "20", 0);                // 最小QP值 (提高)
-		av_dict_set(&opts, "qp_max", "45", 0);                // 最大QP值 (提高)
-		// 60fps性能优化
+		// QP参数优化 - 进一步提高QP换取速度
+		av_dict_set(&opts, "qp_init", "32", 0);               // 初始QP值 (进一步提高)
+		av_dict_set(&opts, "qp_min", "24", 0);                // 最小QP值 (进一步提高)
+		av_dict_set(&opts, "qp_max", "48", 0);                // 最大QP值 (进一步提高)
+		// 60fps极限性能优化
 		av_dict_set(&opts, "preset", "ultrafast", 0);         // 最快预设
 		av_dict_set(&opts, "tune", "zerolatency", 0);         // 零延迟调优
+		av_dict_set(&opts, "threads", "4", 0);                // 限制线程数避免过度竞争
+		av_dict_set(&opts, "slices", "4", 0);                 // 多slice并行编码
 	} else if (type == US_HWENC_NVENC) {
 		av_dict_set(&opts, "preset", "fast", 0);
 		av_dict_set(&opts, "profile", "main", 0);
