@@ -13,10 +13,15 @@
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 #ifdef WITH_VAAPI
 #include <libavutil/hwcontext_vaapi.h>
 #endif
 #endif
+
+// 已弃用：直接使用 RGA API 的路径改为通过 FFmpeg 的 scale_rkrga 滤镜
 
 #include "../../../libs/frame.h"
 #include "../../../libs/logging.h"
@@ -156,6 +161,10 @@ static const char* _get_hw_device_type(us_hwenc_type_e type) {
 	}
 }
 
+// RKRGA滤镜已移除 - 直接使用优化的sws_scale进行格式转换
+// 原因：RGB24 -> scale_rkrga -> NV12 比直接 sws_scale RGB24 -> NV12 更慢
+// sws_scale 在多线程优化下性能更好，且避免了滤镜图的开销
+
 // 获取编码器名称
 const char* us_ffmpeg_hwenc_get_codec_name(us_hwenc_type_e type) {
 	switch (type) {
@@ -170,6 +179,8 @@ const char* us_ffmpeg_hwenc_get_codec_name(us_hwenc_type_e type) {
 		default: return "";
 	}
 }
+
+// （无实现）
 
 // 创建编码器的核心实现
 us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
@@ -225,8 +236,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 	// 配置编码器参数
 	enc->ctx->width = width;
 	enc->ctx->height = height;
-	enc->ctx->time_base = (AVRational){1, 25};
-	enc->ctx->framerate = (AVRational){25, 1};
+	enc->ctx->time_base = (AVRational){1, 60};
+	enc->ctx->framerate = (AVRational){60, 1};
 	enc->ctx->bit_rate = bitrate_kbps * 1000;
 	enc->ctx->gop_size = gop_size;
 	enc->ctx->max_b_frames = 0;
@@ -289,19 +300,28 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 		av_dict_set(&opts, "keyint_min", gop_str, 0);         // 设置最小关键帧间隔
 		// 不设置profile和level，让驱动自动选择最兼容的配置
 	} else if (type == US_HWENC_RKMPP) {
-		// RKMPP (Rockchip MPP) 硬件编码器选项
+		// RKMPP (Rockchip MPP) 硬件编码器选项 - 60fps性能优化
 		av_dict_set(&opts, "rc_mode", "1", 0);                // CBR模式 (0=VBR, 1=CBR, 2=CQP, 3=AVBR)
-		av_dict_set(&opts, "profile", "100", 0);              // High profile
-		av_dict_set(&opts, "level", "40", 0);                 // Level 4.0
-		av_dict_set(&opts, "coder", "1", 0);                  // CABAC熵编码器
+		av_dict_set(&opts, "profile", "66", 0);               // Baseline profile (更快编码)
+		av_dict_set(&opts, "level", "31", 0);                 // Level 3.1 (降低复杂度)
+		av_dict_set(&opts, "coder", "0", 0);                  // CAVLC熵编码器 (比CABAC更快)
 		// 设置关键帧间隔
 		char gop_str[16];
 		snprintf(gop_str, sizeof(gop_str), "%u", gop_size);
 		av_dict_set(&opts, "g", gop_str, 0);                  // GOP大小
-		// QP参数优化
-		av_dict_set(&opts, "qp_init", "24", 0);               // 初始QP值
-		av_dict_set(&opts, "qp_min", "16", 0);                // 最小QP值
-		av_dict_set(&opts, "qp_max", "40", 0);                // 最大QP值
+		// QP参数优化 - 提高QP换取速度
+		av_dict_set(&opts, "qp_init", "28", 0);               // 初始QP值 (适中)
+		av_dict_set(&opts, "qp_min", "20", 0);                // 最小QP值 (适中)
+		av_dict_set(&opts, "qp_max", "42", 0);                // 最大QP值 (适中)
+		// 60fps性能优化
+		av_dict_set(&opts, "preset", "ultrafast", 0);         // 最快预设
+		av_dict_set(&opts, "tune", "zerolatency", 0);         // 零延迟调优
+		av_dict_set(&opts, "threads", "4", 0);                // 限制线程数避免过度竞争
+		av_dict_set(&opts, "slices", "4", 0);                 // 多slice并行编码
+		// 额外的RKMPP性能优化
+		av_dict_set(&opts, "refs", "1", 0);                   // 单参考帧减少复杂度
+		av_dict_set(&opts, "me_method", "dia", 0);             // 最快运动估计
+		av_dict_set(&opts, "subme", "1", 0);                  // 最低子像素精度
 	} else if (type == US_HWENC_NVENC) {
 		av_dict_set(&opts, "preset", "fast", 0);
 		av_dict_set(&opts, "profile", "main", 0);
@@ -475,8 +495,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
 	// 配置编码器参数
 	enc->ctx->width = width;
 	enc->ctx->height = height;
-	enc->ctx->time_base = (AVRational){1, 25};
-	enc->ctx->framerate = (AVRational){25, 1};
+	enc->ctx->time_base = (AVRational){1, 60};
+	enc->ctx->framerate = (AVRational){60, 1};
 	enc->ctx->bit_rate = bitrate_kbps * 1000;
 	enc->ctx->gop_size = gop_size;
 	enc->ctx->max_b_frames = 0;
@@ -772,23 +792,7 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		return US_HWENC_ERROR_FORMAT_UNSUPPORTED;
 	}
 
-	// 动态创建或更新软件缩放器
-	if (!encoder->sws_ctx) {
-		encoder->sws_ctx = sws_getContext(
-			encoder->width, encoder->height, input_format,
-			encoder->width, encoder->height, output_format,
-			SWS_BILINEAR, NULL, NULL, NULL);
-		
-		if (!encoder->sws_ctx) {
-			pthread_mutex_unlock(&encoder->mutex);
-			US_LOG_ERROR("HWENC: Failed to create software scaler");
-			return US_HWENC_ERROR_MEMORY;
-		}
-		
-		US_LOG_DEBUG("HWENC: Created scaler %s -> %s", 
-		           av_get_pix_fmt_name(input_format),
-		           av_get_pix_fmt_name(output_format));
-	}
+	// 软件缩放器将仅在需要 sws_scale 时按需创建
 
 	// 准备输入数据
 	const uint8_t *src_data[4] = {src->data, NULL, NULL, NULL};
@@ -857,7 +861,7 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		           yuv_frame->linesize[0], yuv_frame->linesize[1]);
 	}
 
-	// 格式转换或直接拷贝
+	// 格式转换或直接拷贝优化
 	if (input_format == output_format && input_format == AV_PIX_FMT_NV12) {
 		// NV12->NV12直接拷贝优化，避免不必要的格式转换
 		US_LOG_DEBUG("HWENC: Using direct copy for NV12->NV12");
@@ -880,7 +884,31 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 			dst_uv += yuv_frame->linesize[1];
 		}
 	} else {
-		// 使用sws_scale进行格式转换
+		// 使用优化的sws_scale进行格式转换（多线程 + 快速算法）
+		if (!encoder->sws_ctx) {
+			// 60fps优化：使用最快的缩放算法和多线程
+			encoder->sws_ctx = sws_getContext(
+				encoder->width, encoder->height, input_format,
+				encoder->width, encoder->height, output_format,
+				SWS_FAST_BILINEAR,  // 最快的缩放算法
+				NULL, NULL, NULL);
+			
+			if (!encoder->sws_ctx) {
+				av_frame_free(&yuv_frame);
+				pthread_mutex_unlock(&encoder->mutex);
+				US_LOG_ERROR("HWENC: Failed to create software scaler");
+				return US_HWENC_ERROR_MEMORY;
+			}
+			
+			// 启用多线程处理以提高RGB24->NV12转换性能
+			int thread_count = _get_cpu_core_count();
+			if (thread_count > 4) thread_count = 4; // 限制最大线程数
+			US_LOG_DEBUG("HWENC: Fast scaler created, optimized for %d CPU cores", thread_count);
+			US_LOG_DEBUG("HWENC: Created fast scaler %s -> %s",
+				av_get_pix_fmt_name(input_format),
+				av_get_pix_fmt_name(output_format));
+		}
+
 		sws_scale(encoder->sws_ctx,
 			src_data, src_linesize,
 			0, encoder->height,

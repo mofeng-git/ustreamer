@@ -78,9 +78,18 @@ endef
 
 ifneq ($(call optbool,$(WITH_FFMPEG)),)
 override _CFLAGS += -DWITH_FFMPEG
-override _USTR_LDFLAGS += -lavcodec -lavformat -lavutil -lswscale
+override _USTR_LDFLAGS += -lavcodec -lavformat -lavutil -lswscale -lavfilter
 override _USTR_SRCS += $(shell ls ustreamer/encoders/ffmpeg_hwenc/*.c)
 endif
+
+# 添加MPP支持，用于原生RKMPP硬件加速
+ifneq ($(call optbool,$(WITH_MPP)),)
+override _CFLAGS += -DWITH_MPP -I/usr/include/rockchip
+override _USTR_LDFLAGS += -L/usr/lib/aarch64-linux-gnu -lrockchip_mpp
+override _USTR_SRCS += $(shell ls ustreamer/encoders/mpp/*.c)
+endif
+
+# 移除直接 RGA API 依赖，改用 FFmpeg 的 scale_rkrga 滤镜（由 FFmpeg 自行链接）
 
 ifneq ($(call optbool,$(WITH_MEDIACODEC)),)
 override _CFLAGS += -DWITH_MEDIACODEC
@@ -105,13 +114,25 @@ ifneq ($(MK_WITH_PDEATHSIG),)
 override _CFLAGS += -DMK_WITH_PDEATHSIG -DWITH_PDEATHSIG
 endif
 
+ifneq ($(MK_WITH_DRM),)
+override _CFLAGS += -DMK_WITH_DRM -DWITH_DRM $(shell $(PKG_CONFIG) --cflags libdrm)
+override _USTR_SRCS += $(shell ls libs/drm/*.c)
+override _USTR_LDFLAGS += $(shell $(PKG_CONFIG) --libs libdrm)
+endif
+
 ifneq ($(MK_WITH_V4P),)
 override _TARGETS += $(_V4P)
 override _OBJS += $(_V4P_SRCS:%.c=$(_BUILD)/%.o)
-override _CFLAGS += -DMK_WITH_V4P -DWITH_V4P $(shell $(PKG_CONFIG) --cflags libdrm)
+override _CFLAGS += -DMK_WITH_V4P -DWITH_V4P
 override _V4P_LDFLAGS += $(shell $(PKG_CONFIG) --libs libdrm)
+ifneq ($(MK_WITH_DRM),)
+# DRM already included above
+else
+# Include DRM only for V4P if DRM is not explicitly enabled
+override _CFLAGS += $(shell $(PKG_CONFIG) --cflags libdrm)
 override _USTR_SRCS += $(shell ls libs/drm/*.c)
 override _USTR_LDFLAGS += $(shell $(PKG_CONFIG) --libs libdrm)
+endif
 endif
 
 

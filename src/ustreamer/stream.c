@@ -49,7 +49,7 @@
 #	include <x264.h>
 #endif
 
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 #	include "../libs/drm/drm.h"
 #endif
 
@@ -62,6 +62,9 @@
 #endif
 #ifdef WITH_FFMPEG
 #	include "encoders/ffmpeg_hwenc/ffmpeg_hwenc.h"
+#endif
+#ifdef WITH_MPP
+#	include "encoders/mpp/mpp_encoder.h"
 #endif
 #ifdef WITH_GPIO
 #	include "gpio/gpio.h"
@@ -87,7 +90,7 @@ static void *_releaser_thread(void *v_ctx);
 static void *_jpeg_thread(void *v_ctx);
 static void *_raw_thread(void *v_ctx);
 static void *_h264_thread(void *v_ctx);
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void *_drm_thread(void *v_ctx);
 #endif
 
@@ -97,7 +100,7 @@ static bool _stream_has_jpeg_clients_cached(us_stream_s *stream);
 static bool _stream_has_any_clients_cached(us_stream_s *stream);
 static int _stream_init_loop(us_stream_s *stream);
 static void _stream_update_captured_fpsi(us_stream_s *stream, const us_frame_s *frame, bool bump);
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void _stream_drm_ensure_no_signal(us_stream_s *stream);
 #endif
 static void _stream_expose_jpeg(us_stream_s *stream, const us_frame_s *frame);
@@ -109,7 +112,7 @@ static void _stream_check_suicide(us_stream_s *stream);
 us_stream_s *us_stream_init(us_capture_s *cap, us_encoder_s *enc) {
 	us_stream_http_s *http;
 	US_CALLOC(http, 1);
-#	ifdef WITH_V4P
+#	if defined(WITH_DRM) || defined(WITH_V4P)
 	http->drm_fpsi = us_fpsi_init("DRM", true);
 #	endif
 	http->h264_fpsi = us_fpsi_init("H264", true);
@@ -149,7 +152,7 @@ void us_stream_destroy(us_stream_s *stream) {
 	us_fpsi_destroy(stream->run->http->captured_fpsi);
 	US_RING_DELETE_WITH_ITEMS(stream->run->http->jpeg_ring, us_frame_destroy);
 	us_fpsi_destroy(stream->run->http->h264_fpsi);
-#	ifdef WITH_V4P
+#	if defined(WITH_DRM) || defined(WITH_V4P)
 	us_fpsi_destroy(stream->run->http->drm_fpsi);
 #	endif
 	us_blank_destroy(stream->run->blank);
@@ -169,11 +172,31 @@ void us_stream_loop(us_stream_s *stream) {
 		run->h264_dest = us_frame_init();
 		run->h264_enc = us_m2m_h264_encoder_init("H264", stream->h264_m2m_path, stream->h264_bitrate, stream->h264_gop);
 	}
+#ifdef WITH_MPP
+	// 初始化MPP transcoder (用于RKMPP硬件加速)
+	if (stream->h264_sink != NULL && stream->h264_hwenc != NULL && 
+		strcasecmp(stream->h264_hwenc, "rkmpp") == 0) {
+		US_LOG_INFO("H264: Initializing native MPP transcoder for RKMPP ...");
+		
+		us_mpp_error_e mpp_error = us_mpp_transcoder_create(&run->mpp_transcoder,
+			cap->width, cap->height, stream->h264_bitrate, stream->h264_gop,
+			30, 1); // 假设30fps，可以后续配置化
+			
+		if (mpp_error != US_MPP_OK) {
+			US_LOG_ERROR("H264: Failed to initialize MPP transcoder: %s", us_mpp_error_string(mpp_error));
+			run->mpp_transcoder = NULL;
+		} else {
+			US_LOG_INFO("H264: MPP transcoder initialized successfully (native RKMPP)");
+		}
+	}
+#endif
+
 #ifdef WITH_FFMPEG
-	if (stream->h264_sink != NULL && stream->enc->type == US_ENCODER_TYPE_FFMPEG_VIDEO) {
+	if (stream->h264_sink != NULL && stream->enc->type == US_ENCODER_TYPE_FFMPEG_VIDEO &&
+		!(stream->h264_hwenc != NULL && strcasecmp(stream->h264_hwenc, "rkmpp") == 0)) {
 		US_LOG_INFO("H264: Initializing FFmpeg hardware encoder ...");
 		
-		// 解析硬件编码器类型
+		// 解析硬件编码器类型 (排除RKMPP，使用原生MPP)
 		us_hwenc_type_e hwenc_type = US_HWENC_LIBX264; // 默认软件编码
 		if (stream->h264_hwenc != NULL) {
 			if (strcasecmp(stream->h264_hwenc, "vaapi") == 0) {
@@ -184,8 +207,6 @@ void us_stream_loop(us_stream_s *stream) {
 				hwenc_type = US_HWENC_AMF;
 			} else if (strcasecmp(stream->h264_hwenc, "v4l2m2m") == 0) {
 				hwenc_type = US_HWENC_V4L2_M2M;
-			} else if (strcasecmp(stream->h264_hwenc, "rkmpp") == 0) {
-				hwenc_type = US_HWENC_RKMPP;
 			} else if (strcasecmp(stream->h264_hwenc, "mediacodec") == 0) {
 				hwenc_type = US_HWENC_MEDIACODEC;
 			} else if (strcasecmp(stream->h264_hwenc, "videotoolbox") == 0) {
@@ -256,7 +277,7 @@ void us_stream_loop(us_stream_s *stream) {
 		CREATE_WORKER(true, jpeg_ctx, _jpeg_thread, cap->run->n_bufs);
 		CREATE_WORKER((stream->raw_sink != NULL), raw_ctx, _raw_thread, 2);
 		CREATE_WORKER((stream->h264_sink != NULL), h264_ctx, _h264_thread, cap->run->n_bufs);
-#		ifdef WITH_V4P
+#		if defined(WITH_DRM) || defined(WITH_V4P)
 		CREATE_WORKER((stream->drm != NULL), drm_ctx, _drm_thread, cap->run->n_bufs); // cppcheck-suppress assertWithSideEffect
 #		endif
 #		undef CREATE_WORKER
@@ -285,7 +306,7 @@ void us_stream_loop(us_stream_s *stream) {
 			QUEUE_HW(jpeg_ctx);
 			QUEUE_HW(raw_ctx);
 			QUEUE_HW(h264_ctx);
-#			ifdef WITH_V4P
+#			if defined(WITH_DRM) || defined(WITH_V4P)
 			QUEUE_HW(drm_ctx);
 #			endif
 #			undef QUEUE_HW
@@ -310,7 +331,7 @@ void us_stream_loop(us_stream_s *stream) {
 				us_queue_destroy(x_ctx->queue); \
 				free(x_ctx); \
 			}
-#		ifdef WITH_V4P
+#		if defined(WITH_DRM) || defined(WITH_V4P)
 		DELETE_WORKER(drm_ctx);
 #		endif
 		DELETE_WORKER(h264_ctx);
@@ -336,6 +357,15 @@ void us_stream_loop(us_stream_s *stream) {
 	}
 
 	US_DELETE(run->h264_enc, us_m2m_encoder_destroy);
+	
+#ifdef WITH_MPP
+	// 清理MPP transcoder
+	if (run->mpp_transcoder != NULL) {
+		us_mpp_transcoder_destroy(run->mpp_transcoder);
+		run->mpp_transcoder = NULL;
+	}
+#endif
+	
 #ifdef WITH_MEDIACODEC
 	if (stream->h264_sink != NULL && stream->enc->type == US_ENCODER_TYPE_MEDIACODEC_VIDEO) us_android_mediacodec_destroy(&run->android_bridge_enc);
 #endif
@@ -503,9 +533,15 @@ static void *_h264_thread(void *v_ctx) {
 	return NULL;
 }
 
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void *_drm_thread(void *v_ctx) {
 	US_THREAD_SETTLE("str_drm");
+	
+	// 设置低优先级，确保不影响采集和Web服务
+	if (nice(10) < 0) {
+		US_LOG_PERROR("DRM: Can't set low priority (ignored)");
+	}
+	
 	_worker_context_s *ctx = v_ctx;
 	us_stream_s *stream = ctx->stream;
 
@@ -533,11 +569,18 @@ static void *_drm_thread(void *v_ctx) {
 
 			us_capture_hwbuf_s *hw = _get_latest_hw(ctx->queue);
 			if (hw == NULL) {
+				// 无新帧时短暂等待，避免占用CPU
+				usleep(16666); // ~60fps检查频率
 				continue;
 			}
 
 			if (stream->drm->run->opened == 0) {
-				CHECK(us_drm_expose_dma(stream->drm, hw));
+				// 检查是否启用居中模式
+				if (stream->drm->center_mode) {
+					CHECK(us_drm_expose_centered(stream->drm, hw));
+				} else {
+					CHECK(us_drm_expose_dma(stream->drm, hw));
+				}
 				prev_hw = hw;
 				us_fpsi_meta_s meta = {.online = true}; // Online means live video
 				us_fpsi_update(stream->run->http->drm_fpsi, true, &meta);
@@ -593,7 +636,7 @@ static bool _stream_has_any_clients_cached(us_stream_s *stream) {
 		_stream_has_jpeg_clients_cached(stream)
 		|| (stream->h264_sink != NULL && atomic_load(&stream->h264_sink->has_clients))
 		|| (stream->raw_sink != NULL && atomic_load(&stream->raw_sink->has_clients))
-#		ifdef WITH_V4P
+#		if defined(WITH_DRM) || defined(WITH_V4P)
 		|| (stream->drm != NULL)
 #		endif
 	);
@@ -624,7 +667,7 @@ static int _stream_init_loop(us_stream_s *stream) {
 			stream->enc->type == US_ENCODER_TYPE_M2M_VIDEO
 			|| stream->enc->type == US_ENCODER_TYPE_M2M_IMAGE
 			|| stream->h264_sink != NULL
-#			ifdef WITH_V4P
+#			if defined(WITH_DRM) || defined(WITH_V4P)
 			|| stream->drm != NULL
 #			endif
 		);
@@ -735,7 +778,7 @@ static void _stream_update_captured_fpsi(us_stream_s *stream, const us_frame_s *
 	}
 }
 
-#ifdef WITH_V4P
+#if defined(WITH_DRM) || defined(WITH_V4P)
 static void _stream_drm_ensure_no_signal(us_stream_s *stream) {
 	if (stream->drm == NULL) {
 		return;
@@ -789,16 +832,44 @@ static void _stream_encode_expose_h264(us_stream_s *stream, const us_frame_s *fr
 	us_stream_runtime_s *run = stream->run;
 
 	us_fpsi_meta_s meta = {.online = false};
+	
+	// 检查是否需要关键帧
+	if (run->h264_key_requested) {
+		US_LOG_VERBOSE("H264: Requested keyframe by a sink client");
+		run->h264_key_requested = false;
+		force_key = true;
+	}
+
+#ifdef WITH_MPP
+	// MPP transcoder 处理（MJPEG直接转H264，性能最优）
+	if (run->mpp_transcoder != NULL) {
+		US_LOG_VERBOSE("H264: Processing frame using native MPP transcoder");
+		
+		// 检查输入格式，MPP transcoder期望MJPEG输入
+		if (!us_is_jpeg(frame->format)) {
+			US_LOG_ERROR("H264: MPP transcoder requires MJPEG input, got format %u", frame->format);
+			goto done;
+		}
+		
+		us_mpp_error_e mpp_error = us_mpp_transcoder_process(run->mpp_transcoder, 
+															frame, run->h264_dest, force_key);
+		if (mpp_error == US_MPP_OK) {
+			meta.online = !us_memsink_server_put(stream->h264_sink, run->h264_dest, &run->h264_key_requested);
+			US_LOG_VERBOSE("H264: Native MPP transcode success: %ux%u MJPEG -> %zu bytes H264",
+						  frame->width, frame->height, run->h264_dest->used);
+		} else {
+			US_LOG_ERROR("H264: Native MPP transcode failed: %s", us_mpp_error_string(mpp_error));
+		}
+		goto done;
+	}
+#endif
+
+	// 传统流程：先解JPEG（如果需要）
 	if (us_is_jpeg(frame->format)) {
 		if (us_unjpeg(frame, run->h264_tmp_src, true) < 0) {
 			goto done;
 		}
 		frame = run->h264_tmp_src;
-	}
-	if (run->h264_key_requested) {
-		US_LOG_VERBOSE("H264: Requested keyframe by a sink client");
-		run->h264_key_requested = false;
-		force_key = true;
 	}
 
 #if !defined(WITH_FFMPEG) && !defined(WITH_MEDIACODEC)

@@ -52,6 +52,8 @@ struct AVFrame;
 struct AVPacket;
 struct SwsContext;
 struct AVBufferRef;
+struct AVFilterGraph;
+struct AVFilterContext;
 
 // FFmpeg硬件编码器结构体
 typedef struct {

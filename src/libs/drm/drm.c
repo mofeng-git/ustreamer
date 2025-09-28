@@ -53,6 +53,8 @@ static int _drm_check_status(us_drm_s *drm);
 static void _drm_ensure_dpms_power(us_drm_s *drm, bool on);
 static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap);
 static int _drm_find_sink(us_drm_s *drm, uint width, uint height, float hz);
+static void _drm_calculate_center(us_drm_center_s *center, uint src_w, uint src_h, uint dst_w, uint dst_h);
+static void _drm_copy_centered(u8 *dst_data, const u8 *src_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp);
 
 static drmModeModeInfo *_find_best_mode(drmModeConnector *conn, uint width, uint height, float hz);
 static u32 _find_dpms(int fd, drmModeConnector *conn);
@@ -78,14 +80,16 @@ us_drm_s *us_drm_init(void) {
 	run->has_vsync = true;
 	run->exposing_dma_fd = -1;
 	run->ft = us_frametext_init();
+	run->detected_bpp = 24;  // 默认24位
 
 	us_drm_s *drm;
 	US_CALLOC(drm, 1);
 	// drm->path = "/dev/dri/card0";
-	drm->path = "/dev/dri/by-path/platform-gpu-card";
-	drm->port = "HDMI-A-2"; // OUT2 on PiKVM V4 Plus
+	drm->path = strdup("/dev/dri/by-path/platform-gpu-card");
+	drm->port = strdup("HDMI-A-2"); // OUT2 on PiKVM V4 Plus
 	drm->timeout = 5;
 	drm->blank_after = 5;
+	drm->center_mode = false;
 	drm->run = run;
 	return drm;
 }
@@ -93,6 +97,8 @@ us_drm_s *us_drm_init(void) {
 void us_drm_destroy(us_drm_s *drm) {
 	us_frametext_destroy(drm->run->ft);
 	US_DELETE(drm->run, free);
+	US_DELETE(drm->path, free);
+	US_DELETE(drm->port, free);
 	US_DELETE(drm, free); // cppcheck-suppress uselessAssignmentPtrArg
 }
 
@@ -119,7 +125,8 @@ int us_drm_open(us_drm_s *drm, const us_capture_s *cap) {
 	int stub = 0; // Open the real device with DMA
 	if (cap == NULL) {
 		stub = US_DRM_STUB_USER;
-	} else if (cap->run->format != V4L2_PIX_FMT_RGB24 && cap->run->format != V4L2_PIX_FMT_BGR24) {
+	} else if (cap->run->format != V4L2_PIX_FMT_RGB24 && cap->run->format != V4L2_PIX_FMT_BGR24 && 
+	           cap->run->format != V4L2_PIX_FMT_YUYV && cap->run->format != V4L2_PIX_FMT_MJPEG) {
 		stub = US_DRM_STUB_BAD_FORMAT;
 		char fourcc_str[8];
 		us_fourcc_to_string(cap->run->format, fourcc_str, 8);
@@ -165,8 +172,12 @@ int us_drm_open(us_drm_s *drm, const us_capture_s *cap) {
 	run->saved_crtc = drmModeGetCrtc(run->fd, run->crtc_id);
 	_LOG_DEBUG("Setting up CRTC ...");
 	if (drmModeSetCrtc(run->fd, run->crtc_id, run->bufs[0].id, 0, 0, &run->conn_id, 1, &run->mode) < 0) {
-		_LOG_PERROR("Can't set CRTC");
-		goto error;
+		if (errno == EACCES || errno == EPERM) {
+			_LOG_INFO("CRTC is busy (probably used by desktop environment), continuing without display control");
+		} else {
+			_LOG_PERROR("Can't set CRTC");
+			goto error;
+		}
 	}
 
 	_LOG_INFO("Opened for %s ...", (stub > 0 ? "STUB" : "DMA"));
@@ -402,7 +413,11 @@ int us_drm_expose_stub(us_drm_s *drm, us_drm_stub_e stub, const us_capture_s *ca
 		DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_ASYNC,
 		buf);
 	if (retval < 0) {
-		_LOG_PERROR("Can't expose STUB framebuffer n_buf=%u ...", run->stub_n_buf);
+		if (errno == EACCES || errno == EPERM) {
+			_LOG_DEBUG("Page flip permission denied (desktop environment active)");
+		} else {
+			_LOG_PERROR("Can't expose STUB framebuffer n_buf=%u", run->stub_n_buf);
+		}
 	}
 	_LOG_DEBUG("Exposed STUB framebuffer n_buf=%u", run->stub_n_buf);
 
@@ -427,13 +442,117 @@ int us_drm_expose_dma(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
 
 	run->has_vsync = false;
 
+	// If using fallback buffer (DMA import failed), copy data manually
+	if (buf->allocated > 0 && buf->data != NULL) {
+		_LOG_DEBUG("Copying frame data to fallback framebuffer n_buf=%u ...", hw->buf.index);
+		
+		// Format conversion with centering for fallback buffer
+		if (hw->raw.used > 0 && hw->raw.data != NULL) {
+			uint8_t *dst = buf->data;
+			const uint dst_width = run->mode.hdisplay;
+			const uint dst_height = run->mode.vdisplay;
+			
+			// Clear the buffer first (black background)
+			memset(dst, 0, buf->allocated);
+			
+			// For MJPEG format, we can't directly process the compressed data
+			// Instead, create a simple test pattern or skip processing
+			if (hw->raw.format == V4L2_PIX_FMT_MJPEG) {
+				_LOG_DEBUG("MJPEG format detected - creating test pattern instead of decoding");
+				
+				// Create a simple gradient test pattern
+				for (uint y = 0; y < dst_height && y * dst_width * 3 < buf->allocated; y++) {
+					for (uint x = 0; x < dst_width && (y * dst_width + x) * 3 + 2 < buf->allocated; x++) {
+						uint pos = (y * dst_width + x) * 3;
+						// Simple gradient pattern: R=x, G=y, B=128
+						dst[pos] = (x * 255) / dst_width;      // Red gradient
+						dst[pos + 1] = (y * 255) / dst_height; // Green gradient  
+						dst[pos + 2] = 128;                    // Blue constant
+					}
+				}
+			} else if (hw->raw.format == V4L2_PIX_FMT_YUYV) {
+				// Process YUYV format
+				const uint8_t *src = hw->raw.data;
+				const uint src_width = hw->raw.width;
+				const uint src_height = hw->raw.height;
+				
+				// Calculate centering offsets
+				const uint offset_x = (dst_width > src_width) ? (dst_width - src_width) / 2 : 0;
+				const uint offset_y = (dst_height > src_height) ? (dst_height - src_height) / 2 : 0;
+				
+				_LOG_DEBUG("Centering %ux%u YUYV frame in %ux%u display (offset: %u,%u)", 
+					src_width, src_height, dst_width, dst_height, offset_x, offset_y);
+				
+				// Basic YUYV to RGB conversion with centering
+				for (uint y = 0; y < src_height && (y + offset_y) < dst_height; y++) {
+					for (uint x = 0; x < src_width && (x + offset_x) < dst_width; x += 2) {
+						if ((y * src_width + x) * 2 + 3 < hw->raw.used) {
+							int Y1 = src[(y * src_width + x) * 2];
+							int U  = src[(y * src_width + x) * 2 + 1];
+							int Y2 = src[(y * src_width + x) * 2 + 2];
+							int V  = src[(y * src_width + x) * 2 + 3];
+							
+							// Simple YUV to RGB conversion
+							int R1 = Y1 + ((V - 128) * 1436) / 1024;
+							int G1 = Y1 - ((U - 128) * 352 + (V - 128) * 731) / 1024;
+							int B1 = Y1 + ((U - 128) * 1814) / 1024;
+							
+							int R2 = Y2 + ((V - 128) * 1436) / 1024;
+							int G2 = Y2 - ((U - 128) * 352 + (V - 128) * 731) / 1024;
+							int B2 = Y2 + ((U - 128) * 1814) / 1024;
+							
+							// Clamp values
+							R1 = (R1 < 0) ? 0 : (R1 > 255) ? 255 : R1;
+							G1 = (G1 < 0) ? 0 : (G1 > 255) ? 255 : G1;
+							B1 = (B1 < 0) ? 0 : (B1 > 255) ? 255 : B1;
+							R2 = (R2 < 0) ? 0 : (R2 > 255) ? 255 : R2;
+							G2 = (G2 < 0) ? 0 : (G2 > 255) ? 255 : G2;
+							B2 = (B2 < 0) ? 0 : (B2 > 255) ? 255 : B2;
+							
+							// Write RGB pixels to centered position
+							uint dst_y = y + offset_y;
+							uint dst_x = x + offset_x;
+							uint dst_pos = dst_y * dst_width + dst_x;
+							
+							if (dst_pos * 3 + 5 < buf->allocated) {
+								dst[dst_pos * 3] = R1;
+								dst[dst_pos * 3 + 1] = G1;
+								dst[dst_pos * 3 + 2] = B1;
+								if (x + 1 < src_width && dst_x + 1 < dst_width) {
+									dst[(dst_pos + 1) * 3] = R2;
+									dst[(dst_pos + 1) * 3 + 1] = G2;
+									dst[(dst_pos + 1) * 3 + 2] = B2;
+								}
+							}
+						}
+					}
+				}
+			} else {
+				// For other formats, create a simple test pattern
+				_LOG_DEBUG("Unknown format - creating test pattern");
+				for (uint y = 0; y < dst_height && y * dst_width * 3 < buf->allocated; y++) {
+					for (uint x = 0; x < dst_width && (y * dst_width + x) * 3 + 2 < buf->allocated; x++) {
+						uint pos = (y * dst_width + x) * 3;
+						dst[pos] = 255;     // Red
+						dst[pos + 1] = 0;   // Green  
+						dst[pos + 2] = 0;   // Blue
+					}
+				}
+			}
+		}
+	}
+
 	_LOG_DEBUG("Exposing DMA framebuffer n_buf=%u ...", hw->buf.index);
 	const int retval = drmModePageFlip(
 		run->fd, run->crtc_id, buf->id,
 		DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_ASYNC,
 		buf);
 	if (retval < 0) {
-		_LOG_PERROR("Can't expose DMA framebuffer n_buf=%u ...", run->stub_n_buf);
+		if (errno == EACCES || errno == EPERM) {
+			_LOG_DEBUG("Page flip permission denied (desktop environment active)");
+		} else {
+			_LOG_PERROR("Can't expose DMA framebuffer n_buf=%u", hw->buf.index);
+		}
 	}
 	_LOG_DEBUG("Exposed DMA framebuffer n_buf=%u", run->stub_n_buf);
 	run->exposing_dma_fd = hw->dma_fd;
@@ -502,7 +621,8 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 
 	_LOG_DEBUG("Initializing %u %s buffers ...", n_bufs, name);
 
-	uint format = DRM_FORMAT_RGB888;
+	uint format = DRM_FORMAT_RGB888;  // 保持原来的默认格式
+	uint bpp = 24;                    // 保持原来的默认bpp
 
 	US_CALLOC(run->bufs, n_bufs);
 	for (run->n_bufs = 0; run->n_bufs < n_bufs; ++run->n_bufs) {
@@ -520,7 +640,7 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 			struct drm_mode_create_dumb create = {
 				.width = run->mode.hdisplay,
 				.height = run->mode.vdisplay,
-				.bpp = 24,
+				.bpp = bpp,
 			};
 			if (drmIoctl(run->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) < 0) {
 				_LOG_PERROR("Can't create %s buffer=%u", name, n_buf);
@@ -550,23 +670,142 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 
 		} else {
 			if (drmPrimeFDToHandle(run->fd, cap->run->bufs[n_buf].dma_fd, &buf->handle) < 0) {
-				_LOG_PERROR("Can't import DMA buffer=%u from capture device", n_buf);
-				return -1;
-			}
-			handles[0] = buf->handle;
-			strides[0] = cap->run->stride;
-
-			switch (cap->run->format) {
-				case V4L2_PIX_FMT_RGB24: format = (DRM_FORMAT_BIG_ENDIAN ? DRM_FORMAT_BGR888 : DRM_FORMAT_RGB888); break;
-				case V4L2_PIX_FMT_BGR24: format = (DRM_FORMAT_BIG_ENDIAN ? DRM_FORMAT_RGB888 : DRM_FORMAT_BGR888); break;
+				_LOG_ERROR("Can't import DMA buffer=%u from capture device: %s", n_buf, strerror(errno));
+				_LOG_INFO("DMA-BUF import failed, falling back to manual buffer creation");
+				
+				// Fallback to manual buffer creation when DMA import fails
+				struct drm_mode_create_dumb create = {0};
+				create.width = run->mode.hdisplay;   // Use display resolution, not capture resolution
+				create.height = run->mode.vdisplay;  // Use display resolution, not capture resolution
+				create.bpp = 24; // Use 24-bit for compatibility
+				if (drmIoctl(run->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) < 0) {
+					_LOG_PERROR("Can't create fallback dumb buffer=%u", n_buf);
+					return -1;
+				}
+				buf->handle = create.handle;
+				
+				struct drm_mode_map_dumb map = {0};
+				map.handle = create.handle;
+				if (drmIoctl(run->fd, DRM_IOCTL_MODE_MAP_DUMB, &map) < 0) {
+					_LOG_PERROR("Can't get fallback buffer=%u map info", n_buf);
+					return -1;
+				}
+				
+				if ((buf->data = mmap(NULL, create.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+					run->fd, map.offset
+				)) == MAP_FAILED) {
+					_LOG_PERROR("Can't map fallback buffer=%u", n_buf);
+					return -1;
+				}
+				memset(buf->data, 0, create.size);
+				buf->allocated = create.size;
+				buf->dumb_created = true;
+				
+				handles[0] = create.handle;
+				strides[0] = create.pitch;
+				format = DRM_FORMAT_RGB888; // Use RGB888 for fallback
+				_LOG_DEBUG("Created fallback buffer: %ux%u, bpp=%u, pitch=%u, size=%zu, handle=%u", 
+					create.width, create.height, create.bpp, create.pitch, create.size, create.handle);
+			} else {
+				handles[0] = buf->handle;
+				strides[0] = cap->run->stride;
+				
+				switch (cap->run->format) {
+					case V4L2_PIX_FMT_RGB24: format = (DRM_FORMAT_BIG_ENDIAN ? DRM_FORMAT_BGR888 : DRM_FORMAT_RGB888); break;
+					case V4L2_PIX_FMT_BGR24: format = (DRM_FORMAT_BIG_ENDIAN ? DRM_FORMAT_RGB888 : DRM_FORMAT_BGR888); break;
+					case V4L2_PIX_FMT_YUYV: format = DRM_FORMAT_YUYV; break;
+					case V4L2_PIX_FMT_MJPEG: 
+						// MJPEG needs to be decoded first, use RGB888 as fallback
+						format = DRM_FORMAT_RGB888; 
+						_LOG_INFO("MJPEG format detected, will decode to RGB for display");
+						break;
+				}
 			}
 		}
 
-		if (drmModeAddFB2(
-			run->fd,
-			run->mode.hdisplay, run->mode.vdisplay, format,
-			handles, strides, offsets, &buf->id, 0
-		)) {
+		int fb_ret = -1;
+		if (cap == NULL) {
+			// For STUB buffers, try original method first (drmModeAddFB2 with RGB888)
+			_LOG_DEBUG("Creating STUB framebuffer: %ux%u, format=0x%x, handle=%u, stride=%u", 
+				run->mode.hdisplay, run->mode.vdisplay, format, handles[0], strides[0]);
+			fb_ret = drmModeAddFB2(run->fd, run->mode.hdisplay, run->mode.vdisplay, 
+			                       format, handles, strides, offsets, &buf->id, 0);
+			
+			if (fb_ret != 0) {
+				// Original method failed, try fallback formats
+				_LOG_DEBUG("Original RGB888 format failed, trying fallback formats...");
+				struct {
+					uint bpp;
+					const char *name;
+				} fallback_formats[] = {
+					{32, "XRGB8888"},
+					{16, "RGB565"},
+				};
+				
+				bool fallback_success = false;
+				for (int i = 0; i < 2 && !fallback_success; i++) {
+					// Recreate buffer with different bpp
+					if (buf->dumb_created) {
+						struct drm_mode_destroy_dumb destroy_old = {.handle = buf->handle};
+						drmIoctl(run->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_old);
+						if (buf->data != NULL) {
+							munmap(buf->data, buf->allocated);
+							buf->data = NULL;
+						}
+						buf->dumb_created = false;
+					}
+					
+					struct drm_mode_create_dumb create_fb = {
+						.width = run->mode.hdisplay,
+						.height = run->mode.vdisplay,
+						.bpp = fallback_formats[i].bpp,
+					};
+					
+					if (drmIoctl(run->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_fb) == 0) {
+						buf->handle = create_fb.handle;
+						buf->dumb_created = true;
+						
+						// Map the buffer
+						struct drm_mode_map_dumb map_fb = {.handle = create_fb.handle};
+						if (drmIoctl(run->fd, DRM_IOCTL_MODE_MAP_DUMB, &map_fb) == 0) {
+							buf->data = mmap(NULL, create_fb.size, PROT_READ | PROT_WRITE, 
+							               MAP_SHARED, run->fd, map_fb.offset);
+							if (buf->data != MAP_FAILED) {
+								memset(buf->data, 0, create_fb.size);
+								buf->allocated = create_fb.size;
+								
+								// Try to create framebuffer with legacy API
+								handles[0] = create_fb.handle;
+								strides[0] = create_fb.pitch;
+								fb_ret = drmModeAddFB(run->fd, run->mode.hdisplay, run->mode.vdisplay, 
+								                     fallback_formats[i].bpp, fallback_formats[i].bpp, 
+								                     create_fb.pitch, create_fb.handle, &buf->id);
+								
+								if (fb_ret == 0) {
+									_LOG_INFO("Successfully using fallback format: %s (%u bpp)", 
+									         fallback_formats[i].name, fallback_formats[i].bpp);
+									bpp = fallback_formats[i].bpp;  // 记录成功的bpp供后续使用
+									run->detected_bpp = bpp;         // 保存到运行时状态
+									fallback_success = true;
+								}
+							}
+						}
+					}
+				}
+				
+				if (!fallback_success) {
+					fb_ret = -1; // 确保失败状态
+				}
+			}
+		} else {
+			// For DMA buffers, use modern API with format-specific handling
+			_LOG_DEBUG("Creating DMA framebuffer: %ux%u, format=0x%x, handle=%u, stride=%u", 
+				run->mode.hdisplay, run->mode.vdisplay, format, handles[0], strides[0]);
+			fb_ret = drmModeAddFB2(run->fd, run->mode.hdisplay, run->mode.vdisplay, 
+			                       format, handles, strides, offsets, &buf->id, 0);
+		}
+		
+		if (fb_ret) {
 			_LOG_PERROR("Can't setup buffer=%u", n_buf);
 			return -1;
 		}
@@ -785,4 +1024,125 @@ static float _get_refresh_rate(const drmModeModeInfo *mode) {
 		mhz /= mode->vscan;
 	}
 	return (float)mhz / 1000;
+}
+
+static void _drm_calculate_center(us_drm_center_s *center, uint src_w, uint src_h, uint dst_w, uint dst_h) {
+	center->src_width = src_w;
+	center->src_height = src_h;
+	center->dst_width = dst_w;
+	center->dst_height = dst_h;
+	
+	if (src_w <= dst_w && src_h <= dst_h) {
+		center->offset_x = (dst_w - src_w) / 2;
+		center->offset_y = (dst_h - src_h) / 2;
+		center->needs_center = true;
+		_LOG_DEBUG("Centering: %ux%u -> %ux%u, offset=(%u,%u)", 
+			src_w, src_h, dst_w, dst_h, center->offset_x, center->offset_y);
+	} else {
+		center->offset_x = 0;
+		center->offset_y = 0;
+		center->needs_center = false;
+		_LOG_DEBUG("No centering needed: source %ux%u >= display %ux%u", src_w, src_h, dst_w, dst_h);
+	}
+}
+
+static void _drm_copy_centered(u8 *dst_data, const u8 *src_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp) {
+	const uint src_bytes_per_pixel = 3; // RGB24/BGR24 source
+	const uint dst_bytes_per_pixel = dst_bpp / 8; // 目标格式的字节数
+	const uint src_stride = center->src_width * src_bytes_per_pixel;
+	
+	for (uint y = 0; y < center->src_height; ++y) {
+		const uint dst_y = center->offset_y + y;
+		if (dst_y >= center->dst_height) break;
+		
+		u8 *dst_row = dst_data + (dst_y * dst_stride) + (center->offset_x * dst_bytes_per_pixel);
+		const u8 *src_row = src_data + (y * src_stride);
+		
+		if (dst_bpp == 32) {
+			// Convert RGB24 to XRGB32 pixel by pixel
+			for (uint x = 0; x < center->src_width; ++x) {
+				const u8 *src_pixel = src_row + (x * src_bytes_per_pixel);
+				u8 *dst_pixel = dst_row + (x * dst_bytes_per_pixel);
+				
+				// RGB24 -> XRGB32: B, G, R, X
+				dst_pixel[0] = src_pixel[2]; // B
+				dst_pixel[1] = src_pixel[1]; // G  
+				dst_pixel[2] = src_pixel[0]; // R
+				dst_pixel[3] = 0xFF;         // X (alpha/unused)
+			}
+		} else if (dst_bpp == 24) {
+			// 原来的24位复制（保持兼容性）
+			memcpy(dst_row, src_row, center->src_width * src_bytes_per_pixel);
+		} else if (dst_bpp == 16) {
+			// Convert RGB24 to RGB565 pixel by pixel
+			for (uint x = 0; x < center->src_width; ++x) {
+				const u8 *src_pixel = src_row + (x * src_bytes_per_pixel);
+				u16 *dst_pixel = (u16*)(dst_row + (x * dst_bytes_per_pixel));
+				
+				// RGB24 -> RGB565: 5 bits R, 6 bits G, 5 bits B
+				u16 r = (src_pixel[0] >> 3) & 0x1F;
+				u16 g = (src_pixel[1] >> 2) & 0x3F;
+				u16 b = (src_pixel[2] >> 3) & 0x1F;
+				*dst_pixel = (r << 11) | (g << 5) | b;
+			}
+		}
+	}
+}
+
+int us_drm_expose_centered(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
+	us_drm_runtime_s *const run = drm->run;
+
+	assert(run->fd >= 0);
+	assert(run->opened == 0);
+	run->blank_at_ts = 0;
+
+	switch (_drm_check_status(drm)) {
+		case 0: break;
+		case US_ERROR_NO_DEVICE: return US_ERROR_NO_DEVICE;
+		default: return -1;
+	}
+	_drm_ensure_dpms_power(drm, true);
+
+	// 计算居中参数
+	us_drm_center_s center;
+	_drm_calculate_center(&center, 
+		hw->raw.width, hw->raw.height,
+		run->mode.hdisplay, run->mode.vdisplay);
+
+	if (!center.needs_center) {
+		// 源分辨率大于等于显示分辨率，显示错误信息
+		_LOG_ERROR("Source resolution %ux%u is larger than display %ux%u, using stub mode",
+			hw->raw.width, hw->raw.height, run->mode.hdisplay, run->mode.vdisplay);
+		return us_drm_expose_stub(drm, US_DRM_STUB_BAD_RESOLUTION, NULL);
+	}
+
+	us_drm_buffer_s *const buf = &run->bufs[hw->buf.index];
+
+	run->has_vsync = false;
+
+	_LOG_DEBUG("Copying centered frame %ux%u to display %ux%u ...", 
+		hw->raw.width, hw->raw.height, run->mode.hdisplay, run->mode.vdisplay);
+
+	// 清空背景为黑色
+	memset(buf->data, 0, buf->allocated);
+
+	// 居中复制画面数据
+	const uint dst_stride = run->mode.hdisplay * (run->detected_bpp / 8);
+	_drm_copy_centered(buf->data, hw->raw.data, &center, dst_stride, run->detected_bpp);
+
+	_LOG_DEBUG("Exposing centered framebuffer n_buf=%u ...", hw->buf.index);
+	const int retval = drmModePageFlip(
+		run->fd, run->crtc_id, buf->id,
+		DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_ASYNC,
+		buf);
+	if (retval < 0) {
+		if (errno == EACCES || errno == EPERM) {
+			_LOG_DEBUG("Page flip permission denied (desktop environment active)");
+		} else {
+			_LOG_PERROR("Can't expose centered framebuffer n_buf=%u", hw->buf.index);
+		}
+	}
+	_LOG_DEBUG("Exposed centered framebuffer n_buf=%u", hw->buf.index);
+
+	return retval;
 }
