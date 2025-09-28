@@ -10,7 +10,13 @@
 #include "rk_mpi.h"
 #include "mpp_frame.h"
 #include "mpp_packet.h"
+#include "mpp_meta.h"
 #include "../../../libs/frame.h"
+
+// MPP packet flags (from mpp_packet_impl.h)
+#ifndef MPP_PACKET_FLAG_INTRA
+#define MPP_PACKET_FLAG_INTRA           (0x00000010)
+#endif
 
 #define US_MPP_TIMEOUT_MS 100
 
@@ -192,6 +198,33 @@ const char* us_mpp_codec_type_string(us_mpp_codec_type_e type);
 bool us_mpp_is_format_supported_for_decode(uint32_t format);
 bool us_mpp_is_format_supported_for_encode(uint32_t format);
 
+// ==== 格式转换支持 ====
+typedef enum {
+    US_MPP_FORMAT_CONVERSION_NONE = 0,    // 无需转换
+    US_MPP_FORMAT_CONVERSION_CPU,         // CPU转换
+    US_MPP_FORMAT_CONVERSION_HW,          // 硬件转换（预留）
+} us_mpp_conversion_type_e;
+
+typedef struct {
+    uint32_t input_format;                // 输入格式
+    uint32_t output_format;               // 输出格式
+    us_mpp_conversion_type_e conversion_type;  // 转换类型
+    bool needs_conversion;                // 是否需要转换
+} us_mpp_format_info_s;
+
+// 格式转换函数
+us_mpp_error_e us_mpp_convert_format(const us_frame_s *input_frame, 
+                                    us_frame_s *output_frame,
+                                    uint32_t target_format);
+
+// 获取格式转换信息
+us_mpp_error_e us_mpp_get_format_conversion_info(uint32_t input_format, 
+                                                uint32_t output_format,
+                                                us_mpp_format_info_s *info);
+
+// 检查格式是否支持
+bool us_mpp_is_format_supported(uint32_t format);
+
 // ==== 配置和调优 ====
 us_mpp_error_e us_mpp_processor_set_debug_level(us_mpp_processor_s *processor, uint32_t level);
 us_mpp_error_e us_mpp_processor_enable_zero_copy(us_mpp_processor_s *processor, bool enable);
@@ -204,14 +237,20 @@ us_mpp_error_e us_mpp_h264_encoder_set_qp_range(us_mpp_processor_s *encoder, uin
 
 // ==== 一体化编解码API ====
 
-// 高级API：MJPEG直接转H264 (内部管理NV12缓冲区)
+// 高级API：多格式输入转H264 (内部管理缓冲区和格式转换)
 typedef struct {
-    us_mpp_processor_s *decoder;  // MJPEG解码器
+    us_mpp_processor_s *decoder;  // MJPEG解码器（可选）
     us_mpp_processor_s *encoder;  // H264编码器
     us_frame_s *nv12_buffer;      // 中间NV12缓冲区
+    us_frame_s *conversion_buffer; // 格式转换缓冲区
     pthread_mutex_t mutex;
     bool initialized;
     us_mpp_stats_s combined_stats;
+    
+    // 格式转换支持
+    uint32_t current_input_format;  // 当前输入格式
+    bool needs_format_conversion;   // 是否需要格式转换
+    us_mpp_format_info_s format_info; // 格式转换信息
 } us_mpp_transcoder_s;
 
 us_mpp_error_e us_mpp_transcoder_create(us_mpp_transcoder_s **transcoder,
@@ -220,7 +259,7 @@ us_mpp_error_e us_mpp_transcoder_create(us_mpp_transcoder_s **transcoder,
                                        uint32_t fps_num, uint32_t fps_den);
 
 us_mpp_error_e us_mpp_transcoder_process(us_mpp_transcoder_s *transcoder,
-                                        const us_frame_s *mjpeg_frame,
+                                        const us_frame_s *input_frame,
                                         us_frame_s *h264_frame,
                                         bool force_key);
 
@@ -233,6 +272,12 @@ us_mpp_error_e _us_mpp_init_buffer_manager(us_mpp_buffer_mgr_s *mgr, uint32_t bu
 void _us_mpp_update_stats(us_mpp_processor_s *proc, uint64_t process_time_us, bool success, bool is_encode);
 uint64_t _us_mpp_get_time_us(void);
 uint32_t _us_mpp_calc_frame_size(uint32_t width, uint32_t height, MppFrameFormat fmt);
+
+// 格式转换内部函数
+us_mpp_error_e _us_mpp_convert_rgb_to_nv12(const us_frame_s *rgb_frame, us_frame_s *nv12_frame);
+us_mpp_error_e _us_mpp_convert_yuyv_to_nv12(const us_frame_s *yuyv_frame, us_frame_s *nv12_frame);
+us_mpp_error_e _us_mpp_convert_yuv420_to_nv12(const us_frame_s *yuv420_frame, us_frame_s *nv12_frame);
+us_mpp_error_e _us_mpp_convert_nv16_to_nv12(const us_frame_s *nv16_frame, us_frame_s *nv12_frame);
 
 #ifdef __cplusplus
 }

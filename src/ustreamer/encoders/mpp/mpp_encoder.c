@@ -346,8 +346,20 @@ bool us_mpp_is_format_supported_for_decode(uint32_t format) {
 }
 
 bool us_mpp_is_format_supported_for_encode(uint32_t format) {
-    // 支持NV12输入进行H264编码
-    return (format == V4L2_PIX_FMT_NV12);
+    // 支持多种输入格式进行H264编码（通过格式转换）
+    switch (format) {
+        case V4L2_PIX_FMT_NV12:      // 直接支持
+        case V4L2_PIX_FMT_RGB24:     // CPU转换
+        case V4L2_PIX_FMT_BGR24:     // CPU转换
+        case V4L2_PIX_FMT_YUYV:      // CPU转换
+        case V4L2_PIX_FMT_YUV420:    // CPU转换
+        case V4L2_PIX_FMT_NV16:      // CPU转换
+        case V4L2_PIX_FMT_MJPEG:     // 硬件解码+编码
+        case V4L2_PIX_FMT_JPEG:      // 硬件解码+编码
+            return true;
+        default:
+            return false;
+    }
 }
 
 void us_mpp_processor_destroy(us_mpp_processor_s *processor) {

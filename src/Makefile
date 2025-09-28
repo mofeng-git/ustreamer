@@ -85,7 +85,7 @@ endif
 # 添加MPP支持，用于原生RKMPP硬件加速
 ifneq ($(call optbool,$(WITH_MPP)),)
 override _CFLAGS += -DWITH_MPP -I/usr/include/rockchip
-override _USTR_LDFLAGS += -L/usr/lib/aarch64-linux-gnu -lrockchip_mpp
+override _USTR_LDFLAGS += -L/usr/lib/aarch64-linux-gnu -lrockchip_mpp -lyuv
 override _USTR_SRCS += $(shell ls ustreamer/encoders/mpp/*.c)
 endif
 

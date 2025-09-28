@@ -13,6 +13,7 @@
 #include "mpp_packet.h"
 #include "mpp_meta.h"
 #include "rk_venc_cfg.h"
+#include "rk_venc_cmd.h"
 
 // uStreamer内部头文件
 #include "../../../libs/logging.h"
@@ -83,24 +84,27 @@ static us_mpp_error_e _us_mpp_h264_configure_encoder(us_mpp_processor_s *encoder
     
     MPP_RET ret = MPP_OK;
     
+    // WebRTC实时流优化：启用低延迟模式
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "base:low_delay", 1);
+    
     // 基本参数配置
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "prep:width", encoder->width);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "prep:height", encoder->height);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "prep:hor_stride", encoder->hor_stride);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "prep:ver_stride", encoder->ver_stride);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "prep:format", MPP_FMT_YUV420SP);
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "prep:range", MPP_FRAME_RANGE_JPEG);  // 按照MPP测试添加
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "prep:range", MPP_FRAME_RANGE_JPEG);
     
     if (ret != MPP_OK) {
         US_MPP_H264_LOG_ERROR("Failed to set prep config: %d", ret);
         return US_MPP_ERROR_INIT;
     }
     
-    // 码率控制配置
-    ret |= mpp_enc_cfg_set_u32(encoder->enc_cfg, "rc:mode", encoder->rc_mode);
+    // WebRTC优化：使用CBR模式保证实时流稳定性
+    ret |= mpp_enc_cfg_set_u32(encoder->enc_cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:bps_target", encoder->bitrate_bps);
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:bps_max", encoder->bitrate_bps * 1.2);  // 允许20%超调
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:bps_min", encoder->bitrate_bps * 0.8);  // 允许20%低调
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:bps_max", encoder->bitrate_bps * 105 / 100);  // 仅5%超调
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:bps_min", encoder->bitrate_bps * 95 / 100);   // 仅5%低调
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:fps_in_flex", 0);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:fps_in_num", encoder->fps_num);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "rc:fps_in_denom", encoder->fps_den);
@@ -114,18 +118,21 @@ static us_mpp_error_e _us_mpp_h264_configure_encoder(us_mpp_processor_s *encoder
         return US_MPP_ERROR_INIT;
     }
     
-    // H264编码器特定配置
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:profile", encoder->profile);
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:level", encoder->level);
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:cabac_en", 1);          // 启用CABAC
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:cabac_idc", 0);         // CABAC IDC
-    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:trans8x8", 1);          // 启用8x8变换
+    // WebRTC低延迟H264配置
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:profile", 66);         // Baseline Profile (66) 降低复杂度
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:level", 31);           // Level 3.1 (720p@30fps)
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:cabac_en", 0);         // 禁用CABAC，使用CAVLC提高速度
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:trans8x8", 0);         // Baseline不支持8x8变换
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:qp_init", encoder->qp_init);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:qp_max", encoder->qp_max);
     ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "h264:qp_min", encoder->qp_min);
     
+    // WebRTC实时场景调优
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "tune:scene_mode", 1);          // IPC模式，适合实时流
+    ret |= mpp_enc_cfg_set_s32(encoder->enc_cfg, "tune:anti_flicker_str", 0);    // 禁用抗闪烁以提高速度
+    
     if (ret != MPP_OK) {
-        US_MPP_H264_LOG_ERROR("Failed to set h264 config: %d", ret);
+        US_MPP_H264_LOG_ERROR("Failed to set low-latency h264 config: %d", ret);
         return US_MPP_ERROR_INIT;
     }
     
@@ -136,10 +143,18 @@ static us_mpp_error_e _us_mpp_h264_configure_encoder(us_mpp_processor_s *encoder
         return US_MPP_ERROR_INIT;
     }
     
-    US_MPP_H264_LOG_INFO("Encoder configured: %ux%u, %u kbps, GOP %u, Profile %u, QP %u-%u",
+    // 设置H264头模式：每个IDR帧都包含SPS/PPS
+    MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
+    ret = encoder->mpi->control(encoder->ctx, MPP_ENC_SET_HEADER_MODE, &header_mode);
+    if (ret != MPP_OK) {
+        US_MPP_H264_LOG_ERROR("Failed to set header mode: %d", ret);
+        return US_MPP_ERROR_INIT;
+    }
+    
+    US_MPP_H264_LOG_INFO("Low-latency H264 encoder (WebRTC): %ux%u, %u kbps, GOP %u, Baseline Profile, CBR, QP %u-%u",
                         encoder->width, encoder->height, 
                         encoder->bitrate_bps / 1000, encoder->gop_size,
-                        encoder->profile, encoder->qp_min, encoder->qp_max);
+                        encoder->qp_min, encoder->qp_max);
     
     return US_MPP_OK;
 }
@@ -172,7 +187,6 @@ static us_mpp_error_e _us_mpp_h264_setup_input_frame(us_mpp_processor_s *encoder
     if (force_key) {
         // 使用KEY_OUTPUT_INTRA来强制I帧
         mpp_meta_set_s32(meta, KEY_OUTPUT_INTRA, 1);
-        US_MPP_H264_LOG_DEBUG("Forcing keyframe");
     }
 
     return US_MPP_OK;
@@ -191,12 +205,23 @@ static us_mpp_error_e _us_mpp_h264_extract_output_packet(us_mpp_processor_s *enc
         return US_MPP_ERROR_ENCODE;
     }
     
+    // 获取关键帧标志 - 从meta中获取
+    MppMeta meta = mpp_packet_get_meta(packet);
+    RK_S32 is_intra = 0;
+    if (meta) {
+        mpp_meta_get_s32(meta, KEY_OUTPUT_INTRA, &is_intra);
+    }
+    bool is_keyframe = (is_intra != 0);
+    
     // 设置输出帧参数
     h264_frame->format = V4L2_PIX_FMT_H264;
     h264_frame->width = encoder->width;
     h264_frame->height = encoder->height;
     h264_frame->stride = 0;  // H264流没有stride概念
     h264_frame->used = length;
+    
+    // 设置关键帧标志
+    h264_frame->key = is_keyframe ? 1 : 0;
     
     // 分配输出缓冲区
     us_frame_realloc_data(h264_frame, length);
@@ -207,21 +232,6 @@ static us_mpp_error_e _us_mpp_h264_extract_output_packet(us_mpp_processor_s *enc
     
     // 拷贝H264数据
     memcpy(h264_frame->data, data, length);
-    
-    // 检查是否为关键帧 - 从meta数据获取
-    bool is_keyframe = false;
-    MppMeta meta = mpp_packet_get_meta(packet);
-    if (meta) {
-        RK_S32 is_intra = 0;
-        mpp_meta_get_s32(meta, KEY_OUTPUT_INTRA, &is_intra);
-        if (is_intra) {
-            is_keyframe = true;
-            encoder->stats.keyframes_generated++;
-        }
-    }
-    
-    US_MPP_H264_LOG_DEBUG("H264 packet extracted: %zu bytes, %s", length, 
-                         is_keyframe ? "KEYFRAME" : "P-FRAME");
     
     return US_MPP_OK;
 }
@@ -322,7 +332,6 @@ us_mpp_error_e us_mpp_h264_encoder_create(us_mpp_processor_s **encoder,
         return US_MPP_ERROR_MEMORY;
     }
     
-    US_MPP_H264_LOG_INFO("Allocated buffers: frame=%zu bytes, packet=%zu bytes", frame_size, frame_size);
     
     atomic_store(&enc->initialized, true);
     *encoder = enc;
@@ -356,7 +365,6 @@ us_mpp_error_e us_mpp_h264_encoder_encode(us_mpp_processor_s *encoder,
         return US_MPP_ERROR_INVALID_PARAM;
     }
 
-    uint64_t start_time = _us_mpp_get_time_us();
     us_mpp_error_e result = US_MPP_OK;
     MPP_RET ret = MPP_OK;
 
@@ -398,7 +406,6 @@ us_mpp_error_e us_mpp_h264_encoder_encode(us_mpp_processor_s *encoder,
         // 获取编码后的数据包
         ret = encoder->mpi->encode_get_packet(encoder->ctx, &packet);
         if (ret == MPP_ERR_TIMEOUT) {
-            US_MPP_H264_LOG_DEBUG("Get packet timeout, assuming all packets received");
             break; // 超时意味着当前帧没有更多数据包，正常退出
         }
         if (ret != MPP_OK) {
@@ -432,26 +439,8 @@ us_mpp_error_e us_mpp_h264_encoder_encode(us_mpp_processor_s *encoder,
     } while (1);
     
 cleanup:
-    atomic_store(&encoder->processing, false);
     encoder->frame_number++;
-    
-    uint64_t end_time = _us_mpp_get_time_us();
-    uint64_t process_time = end_time - start_time;
-    
-    _us_mpp_update_stats(encoder, process_time, (result == US_MPP_OK), true);
-    
     pthread_mutex_unlock(&encoder->mutex);
-    
-    if (result == US_MPP_OK) {
-        US_MPP_H264_LOG_DEBUG("H264 encode success: %ux%u NV12 -> %zu bytes H264 (%.2f ms) %s", 
-                             nv12_frame->width, nv12_frame->height,
-                             h264_frame->used, process_time / 1000.0,
-                             force_key ? "[FORCED KEY]" : "");
-    } else {
-        US_MPP_H264_LOG_ERROR("H264 encode failed: %s (%.2f ms)", 
-                             us_mpp_error_string(result), process_time / 1000.0);
-    }
-    
     return result;
 }
 

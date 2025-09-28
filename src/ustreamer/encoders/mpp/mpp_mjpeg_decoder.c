@@ -304,7 +304,6 @@ us_mpp_error_e us_mpp_mjpeg_decoder_decode(us_mpp_processor_s *decoder,
         return US_MPP_ERROR_INVALID_PARAM;
     }
     
-    uint64_t start_time = _us_mpp_get_time_us();
     us_mpp_error_e result = US_MPP_OK;
     MPP_RET ret = MPP_OK;
     
@@ -333,8 +332,6 @@ us_mpp_error_e us_mpp_mjpeg_decoder_decode(us_mpp_processor_s *decoder,
         goto cleanup;
     }
     
-    US_MPP_MJPEG_LOG_DEBUG("MJPEG data validation OK: size=%zu, header=0x%02X%02X", 
-                          mjpeg_frame->used, data_ptr[0], data_ptr[1]);
     
     // 关键修复：Advanced模式需要用MppBuffer初始化packet（参考mpi_dec_test.c line 286）
     // 确保有输入buffer group
@@ -393,8 +390,6 @@ us_mpp_error_e us_mpp_mjpeg_decoder_decode(us_mpp_processor_s *decoder,
     mpp_packet_set_pts(decoder->packet, 0);
     mpp_packet_set_dts(decoder->packet, 0);
     
-    US_MPP_MJPEG_LOG_DEBUG("Packet setup: data=%p, size=%zu, length=%zu", 
-                          buffer_data, buffer_size, mjpeg_frame->used);
     
     // 关键修复：使用预分配的frame（Advanced模式，参考mpi_dec_test.c dec_advanced）
     // 不要每次都创建新的frame，使用decoder->frame
@@ -410,7 +405,6 @@ us_mpp_error_e us_mpp_mjpeg_decoder_decode(us_mpp_processor_s *decoder,
         mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, decoder->frame);
     }
     
-    US_MPP_MJPEG_LOG_DEBUG("Using pre-allocated frame with buffer for Advanced mode");
     
     // 发送数据包进行解码
     ret = decoder->mpi->decode_put_packet(decoder->ctx, decoder->packet);
@@ -436,9 +430,6 @@ us_mpp_error_e us_mpp_mjpeg_decoder_decode(us_mpp_processor_s *decoder,
     }
     
     // 验证frame引用匹配（advanced模式检查）
-    if (returned_frame != decoder->frame) {
-        US_MPP_MJPEG_LOG_DEBUG("Frame reference mismatch %p -> %p", decoder->frame, returned_frame);
-    }
     
     // 检查是否是info_change帧
     if (mpp_frame_get_info_change(returned_frame)) {
@@ -466,7 +457,6 @@ us_mpp_error_e us_mpp_mjpeg_decoder_decode(us_mpp_processor_s *decoder,
     }
     
     if (mpp_frame_get_eos(returned_frame)) {
-        US_MPP_MJPEG_LOG_DEBUG("EOS frame received");
         result = US_MPP_ERROR_EOS;
         goto cleanup;
     }
@@ -478,30 +468,11 @@ us_mpp_error_e us_mpp_mjpeg_decoder_decode(us_mpp_processor_s *decoder,
         US_MPP_MJPEG_LOG_ERROR("Failed to copy frame data: %s", us_mpp_error_string(copy_err));
         result = copy_err;
     } else {
-        US_MPP_MJPEG_LOG_DEBUG("Successfully decoded MJPEG frame using advanced mode");
         result = US_MPP_OK;
     }
     
 cleanup:
-    atomic_store(&decoder->processing, false);
     decoder->frame_number++;
-    
-    uint64_t end_time = _us_mpp_get_time_us();
-    uint64_t process_time = end_time - start_time;
-    
-    _us_mpp_update_stats(decoder, process_time, (result == US_MPP_OK), false);
-    
     pthread_mutex_unlock(&decoder->mutex);
-    
-    if (result == US_MPP_OK) {
-        US_MPP_MJPEG_LOG_DEBUG("MJPEG decode success: %ux%u -> %ux%u NV12 (%.2f ms)", 
-                              mjpeg_frame->width, mjpeg_frame->height,
-                              nv12_frame->width, nv12_frame->height,
-                              process_time / 1000.0);
-    } else {
-        US_MPP_MJPEG_LOG_ERROR("MJPEG decode failed: %s (%.2f ms)", 
-                              us_mpp_error_string(result), process_time / 1000.0);
-    }
-    
     return result;
 }

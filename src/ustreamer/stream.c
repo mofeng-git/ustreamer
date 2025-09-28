@@ -841,22 +841,16 @@ static void _stream_encode_expose_h264(us_stream_s *stream, const us_frame_s *fr
 	}
 
 #ifdef WITH_MPP
-	// MPP transcoder 处理（MJPEG直接转H264，性能最优）
+	// MPP transcoder 处理（支持多种输入格式转H264）
 	if (run->mpp_transcoder != NULL) {
 		US_LOG_VERBOSE("H264: Processing frame using native MPP transcoder");
-		
-		// 检查输入格式，MPP transcoder期望MJPEG输入
-		if (!us_is_jpeg(frame->format)) {
-			US_LOG_ERROR("H264: MPP transcoder requires MJPEG input, got format %u", frame->format);
-			goto done;
-		}
 		
 		us_mpp_error_e mpp_error = us_mpp_transcoder_process(run->mpp_transcoder, 
 															frame, run->h264_dest, force_key);
 		if (mpp_error == US_MPP_OK) {
 			meta.online = !us_memsink_server_put(stream->h264_sink, run->h264_dest, &run->h264_key_requested);
-			US_LOG_VERBOSE("H264: Native MPP transcode success: %ux%u MJPEG -> %zu bytes H264",
-						  frame->width, frame->height, run->h264_dest->used);
+			US_LOG_VERBOSE("H264: Native MPP transcode success: %ux%u format %u -> %zu bytes H264",
+						  frame->width, frame->height, frame->format, run->h264_dest->used);
 		} else {
 			US_LOG_ERROR("H264: Native MPP transcode failed: %s", us_mpp_error_string(mpp_error));
 		}
