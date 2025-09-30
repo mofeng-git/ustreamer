@@ -278,7 +278,7 @@ void us_stream_loop(us_stream_s *stream) {
 		CREATE_WORKER((stream->raw_sink != NULL), raw_ctx, _raw_thread, 2);
 		CREATE_WORKER((stream->h264_sink != NULL), h264_ctx, _h264_thread, cap->run->n_bufs);
 #		if defined(WITH_DRM) || defined(WITH_V4P)
-		CREATE_WORKER((stream->drm != NULL), drm_ctx, _drm_thread, cap->run->n_bufs); // cppcheck-suppress assertWithSideEffect
+		CREATE_WORKER((stream->drm != NULL), drm_ctx, _drm_thread, 2); // Small queue: _get_latest_hw() drops old frames anyway
 #		endif
 #		undef CREATE_WORKER
 
@@ -303,12 +303,25 @@ void us_stream_loop(us_stream_s *stream) {
 					us_capture_hwbuf_incref(hw); \
 					us_queue_put(x_ctx->queue, hw, 0); \
 				}
+#			define QUEUE_HW_DROP_OLD(x_ctx) if (x_ctx != NULL) { \
+					us_capture_hwbuf_incref(hw); \
+					if (us_queue_put(x_ctx->queue, hw, 0) < 0) { \
+						us_capture_hwbuf_s *old_hw = NULL; \
+						if (us_queue_get(x_ctx->queue, (void**)&old_hw, 0) == 0) { \
+							us_capture_hwbuf_decref(old_hw); \
+							us_queue_put(x_ctx->queue, hw, 0); \
+						} else { \
+							us_capture_hwbuf_decref(hw); \
+						} \
+					} \
+				}
 			QUEUE_HW(jpeg_ctx);
 			QUEUE_HW(raw_ctx);
 			QUEUE_HW(h264_ctx);
 #			if defined(WITH_DRM) || defined(WITH_V4P)
-			QUEUE_HW(drm_ctx);
+			QUEUE_HW_DROP_OLD(drm_ctx);
 #			endif
+#			undef QUEUE_HW_DROP_OLD
 #			undef QUEUE_HW
 			us_queue_put(releasers[hw->buf.index].queue, hw, 0); // Plan to release
 
@@ -563,14 +576,18 @@ static void *_drm_thread(void *v_ctx) {
 
 		CHECK(us_drm_open(stream->drm, ctx->stream->cap));
 
+		// Check if platform needs VSync (only RPI V4P)
+		const bool needs_vsync = (stream->drm->run->platform == US_DRM_PLATFORM_RPI);
+
 		while (!atomic_load(ctx->stop)) {
-			CHECK(us_drm_wait_for_vsync(stream->drm));
+			// Only wait for VSync on platforms that need it
+			if (needs_vsync) {
+				CHECK(us_drm_wait_for_vsync(stream->drm));
+			}
 			US_DELETE(prev_hw, us_capture_hwbuf_decref);
 
 			us_capture_hwbuf_s *hw = _get_latest_hw(ctx->queue);
 			if (hw == NULL) {
-				// 无新帧时短暂等待，避免占用CPU
-				usleep(16666); // ~60fps检查频率
 				continue;
 			}
 
@@ -612,7 +629,7 @@ static void *_drm_thread(void *v_ctx) {
 
 static us_capture_hwbuf_s *_get_latest_hw(us_queue_s *queue) {
 	us_capture_hwbuf_s *hw;
-	if (us_queue_get(queue, (void**)&hw, 0.1) < 0) {
+	if (us_queue_get(queue, (void**)&hw, 0.016) < 0) {
 		return NULL;
 	}
 	while (!us_queue_is_empty(queue)) { // Берем только самый свежий кадр

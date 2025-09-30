@@ -39,6 +39,13 @@ typedef enum {
 	US_DRM_STUB_BUSY,
 } us_drm_stub_e;
 
+typedef enum {
+	US_DRM_PLATFORM_UNKNOWN = 0,
+	US_DRM_PLATFORM_RPI,      // Raspberry Pi V4P - original DRM implementation
+	US_DRM_PLATFORM_AMLOGIC,  // Amlogic (S805, etc.) - simplified display implementation
+	US_DRM_PLATFORM_GENERIC,  // Generic fallback
+} us_drm_platform_e;
+
 typedef struct {
 	uint src_width, src_height;
 	uint dst_width, dst_height;
@@ -80,6 +87,8 @@ typedef struct {
 	int				once;
 	us_frametext_s	*ft;
 	uint			detected_bpp;	// Auto-detected bits per pixel
+	us_drm_platform_e platform;	// Platform type for different DRM handling
+	uint			display_stride;	// Pre-calculated stride for display (hdisplay * 4)
 } us_drm_runtime_s;
 
 typedef struct {
@@ -105,3 +114,7 @@ int us_drm_expose_stub(us_drm_s *drm, us_drm_stub_e stub, const us_capture_s *ca
 int us_drm_expose_dma(us_drm_s *drm, const us_capture_hwbuf_s *hw);
 int us_drm_expose_centered(us_drm_s *drm, const us_capture_hwbuf_s *hw);
 int us_drm_ensure_no_signal(us_drm_s *drm);
+
+// Platform-specific implementations
+int us_drm_expose_rpi_v4p(us_drm_s *drm, const us_capture_hwbuf_s *hw);      // Original V4P implementation
+int us_drm_expose_amlogic_display(us_drm_s *drm, const us_capture_hwbuf_s *hw); // New Amlogic display

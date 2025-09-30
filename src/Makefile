@@ -117,7 +117,7 @@ endif
 ifneq ($(MK_WITH_DRM),)
 override _CFLAGS += -DMK_WITH_DRM -DWITH_DRM $(shell $(PKG_CONFIG) --cflags libdrm)
 override _USTR_SRCS += $(shell ls libs/drm/*.c)
-override _USTR_LDFLAGS += $(shell $(PKG_CONFIG) --libs libdrm)
+override _USTR_LDFLAGS += $(shell $(PKG_CONFIG) --libs libdrm) -lyuv
 endif
 
 ifneq ($(MK_WITH_V4P),)

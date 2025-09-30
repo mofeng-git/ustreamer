@@ -38,6 +38,7 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include <libdrm/drm.h>
+#include <libyuv.h>
 
 #include "../types.h"
 #include "../errors.h"
@@ -46,6 +47,7 @@
 #include "../frame.h"
 #include "../frametext.h"
 #include "../capture.h"
+#include "../unjpeg.h"
 
 
 static void _drm_vsync_callback(int fd, uint n_frame, uint sec, uint usec, void *v_buf);
@@ -54,13 +56,21 @@ static void _drm_ensure_dpms_power(us_drm_s *drm, bool on);
 static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap);
 static int _drm_find_sink(us_drm_s *drm, uint width, uint height, float hz);
 static void _drm_calculate_center(us_drm_center_s *center, uint src_w, uint src_h, uint dst_w, uint dst_h);
-static void _drm_copy_centered(u8 *dst_data, const u8 *src_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp);
+static void _drm_convert_yuyv_simple(const u8 *src_data, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h);
+static void _drm_convert_rgb24(const u8 *src_data, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h);
+static void _drm_convert_bgr24(const u8 *src_data, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h);
+static void _drm_convert_mjpeg(const u8 *src_data, size_t src_size, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h);
+
+// Platform-specific implementation functions
+static int _drm_expose_rpi_v4p_impl(us_drm_s *drm, const us_capture_hwbuf_s *hw);
+static int _drm_expose_amlogic_display_impl(us_drm_s *drm, const us_capture_hwbuf_s *hw);
 
 static drmModeModeInfo *_find_best_mode(drmModeConnector *conn, uint width, uint height, float hz);
 static u32 _find_dpms(int fd, drmModeConnector *conn);
 static u32 _find_crtc(int fd, drmModeRes *res, drmModeConnector *conn, u32 *taken_crtcs);
 static const char *_connector_type_to_string(u32 type);
 static float _get_refresh_rate(const drmModeModeInfo *mode);
+static us_drm_platform_e _detect_drm_platform(int fd);
 
 
 #define _LOG_ERROR(x_msg, ...)	US_LOG_ERROR("DRM: " x_msg, ##__VA_ARGS__)
@@ -81,12 +91,13 @@ us_drm_s *us_drm_init(void) {
 	run->exposing_dma_fd = -1;
 	run->ft = us_frametext_init();
 	run->detected_bpp = 24;  // 默认24位
+	run->platform = US_DRM_PLATFORM_UNKNOWN;  // Will be detected during open
 
 	us_drm_s *drm;
 	US_CALLOC(drm, 1);
 	// drm->path = "/dev/dri/card0";
 	drm->path = strdup("/dev/dri/by-path/platform-gpu-card");
-	drm->port = strdup("HDMI-A-2"); // OUT2 on PiKVM V4 Plus
+	drm->port = NULL; // Auto-detect by default, can be overridden via --drm-port
 	drm->timeout = 5;
 	drm->blank_after = 5;
 	drm->center_mode = false;
@@ -113,7 +124,11 @@ int us_drm_open(us_drm_s *drm, const us_capture_s *cap) {
 		default: goto error;
 	}
 
-	_LOG_INFO("Using passthrough: %s[%s]", drm->path, drm->port);
+	if (drm->port != NULL) {
+		_LOG_INFO("Using passthrough: %s[%s]", drm->path, drm->port);
+	} else {
+		_LOG_INFO("Using passthrough: %s[auto-detect]", drm->path);
+	}
 	_LOG_INFO("Configuring DRM device for %s ...", (cap == NULL ? "STUB" : "DMA"));
 
 	if ((run->fd = open(drm->path, O_RDWR | O_CLOEXEC | O_NONBLOCK)) < 0) {
@@ -121,6 +136,32 @@ int us_drm_open(us_drm_s *drm, const us_capture_s *cap) {
 		goto error;
 	}
 	_LOG_DEBUG("DRM device fd=%d opened", run->fd);
+
+	// Improve DRM master control management
+	_LOG_DEBUG("Checking current DRM master status...");
+	int master_status = drmIsMaster(run->fd);
+	_LOG_DEBUG("Current DRM master status: %s", master_status ? "master" : "not master");
+
+	// Drop master first, then acquire it to ensure clean state
+	drmDropMaster(run->fd);
+	if (drmSetMaster(run->fd) < 0) {
+		_LOG_ERROR("Can't acquire DRM master control: %s", strerror(errno));
+		_LOG_INFO("Hint: Make sure no other programs are using the display (close X11/Wayland sessions)");
+		_LOG_INFO("Or try switching to a virtual terminal (Ctrl+Alt+F1-F6)");
+		goto error;
+	}
+	_LOG_DEBUG("DRM master control acquired successfully");
+
+	// Detect platform type for appropriate handling
+	run->platform = _detect_drm_platform(run->fd);
+	const char *platform_name = "Unknown";
+	switch (run->platform) {
+		case US_DRM_PLATFORM_RPI: platform_name = "Raspberry Pi"; break;
+		case US_DRM_PLATFORM_AMLOGIC: platform_name = "Amlogic"; break;
+		case US_DRM_PLATFORM_GENERIC: platform_name = "Generic"; break;
+		default: break;
+	}
+	_LOG_INFO("Detected DRM platform: %s", platform_name);
 
 	int stub = 0; // Open the real device with DMA
 	if (cap == NULL) {
@@ -171,6 +212,8 @@ int us_drm_open(us_drm_s *drm, const us_capture_s *cap) {
 
 	run->saved_crtc = drmModeGetCrtc(run->fd, run->crtc_id);
 	_LOG_DEBUG("Setting up CRTC ...");
+
+	// Standard CRTC setup for all platforms
 	if (drmModeSetCrtc(run->fd, run->crtc_id, run->bufs[0].id, 0, 0, &run->conn_id, 1, &run->mode) < 0) {
 		if (errno == EACCES || errno == EPERM) {
 			_LOG_INFO("CRTC is busy (probably used by desktop environment), continuing without display control");
@@ -247,6 +290,14 @@ void us_drm_close(us_drm_s *drm) {
 
 	const bool say = (run->fd >= 0);
 	US_CLOSE_FD(run->status_fd);
+
+	// Release DRM master control before closing
+	if (run->fd >= 0) {
+		_LOG_DEBUG("Releasing DRM master control...");
+		if (drmDropMaster(run->fd) < 0 && errno != EINVAL) {
+			_LOG_DEBUG("Failed to drop DRM master: %s (this might be normal)", strerror(errno));
+		}
+	}
 	US_CLOSE_FD(run->fd);
 
 	run->crtc_id = 0;
@@ -316,6 +367,13 @@ int us_drm_wait_for_vsync(us_drm_s *drm) {
 	_drm_ensure_dpms_power(drm, true);
 
 	if (run->has_vsync) {
+		return 0;
+	}
+
+	// Skip VSync wait for Amlogic platforms - they don't support it reliably
+	if (run->platform == US_DRM_PLATFORM_AMLOGIC) {
+		_LOG_DEBUG("Skipping VSync wait on Amlogic platform");
+		run->has_vsync = true; // Mark as having VSync to avoid future calls
 		return 0;
 	}
 
@@ -427,10 +485,17 @@ int us_drm_expose_stub(us_drm_s *drm, us_drm_stub_e stub, const us_capture_s *ca
 
 int us_drm_expose_dma(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
 	us_drm_runtime_s *const run = drm->run;
-	us_drm_buffer_s *const buf = &run->bufs[hw->buf.index];
 
 	assert(run->fd >= 0);
 	assert(run->opened == 0);
+
+	// Safety check for buffer index
+	if (hw->buf.index >= run->n_bufs) {
+		_LOG_ERROR("Invalid buffer index %u (max: %u)", hw->buf.index, run->n_bufs);
+		return -1;
+	}
+
+	us_drm_buffer_s *const buf = &run->bufs[hw->buf.index];
 	run->blank_at_ts = 0;
 
 	switch (_drm_check_status(drm)) {
@@ -562,6 +627,11 @@ int us_drm_expose_dma(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
 static int _drm_check_status(us_drm_s *drm) {
 	us_drm_runtime_s *run = drm->run;
 
+	if (drm->port == NULL) {
+		_LOG_DEBUG("Skipping status file check - port not yet detected");
+		return 0;
+	}
+
 	if (run->status_fd < 0) {
 		_LOG_DEBUG("Trying to find status file ...");
 		struct stat st;
@@ -621,8 +691,20 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 
 	_LOG_DEBUG("Initializing %u %s buffers ...", n_bufs, name);
 
-	uint format = DRM_FORMAT_RGB888;  // 保持原来的默认格式
-	uint bpp = 24;                    // 保持原来的默认bpp
+	uint format = DRM_FORMAT_RGB888;  // Default format
+	uint bpp = 24;                    // Default bpp
+
+	// For all platforms, use simplified dumb buffers with better Amlogic compatibility
+	if (run->platform == US_DRM_PLATFORM_AMLOGIC) {
+		// Amlogic-optimized format but still use dumb buffers (simpler and more reliable)
+		format = DRM_FORMAT_XRGB8888;
+		bpp = 32;  // Use 32-bit for Amlogic compatibility
+		_LOG_INFO("Using Amlogic-optimized dumb buffers: XRGB8888 32-bit");
+	} else {
+		// Standard format for other platforms
+		format = DRM_FORMAT_RGB888;
+		bpp = 24;
+	}
 
 	US_CALLOC(run->bufs, n_bufs);
 	for (run->n_bufs = 0; run->n_bufs < n_bufs; ++run->n_bufs) {
@@ -669,25 +751,47 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 			strides[0] = create.pitch;
 
 		} else {
-			if (drmPrimeFDToHandle(run->fd, cap->run->bufs[n_buf].dma_fd, &buf->handle) < 0) {
-				_LOG_ERROR("Can't import DMA buffer=%u from capture device: %s", n_buf, strerror(errno));
-				_LOG_INFO("DMA-BUF import failed, falling back to manual buffer creation");
-				
-				// Fallback to manual buffer creation when DMA import fails
+			// Skip DMA-BUF import for Amlogic platforms - use direct buffer copy instead
+			bool use_dma_import = false;
+			if (run->platform != US_DRM_PLATFORM_AMLOGIC) {
+				_LOG_DEBUG("Attempting DMA buffer import for buffer %u", n_buf);
+				if (drmPrimeFDToHandle(run->fd, cap->run->bufs[n_buf].dma_fd, &buf->handle) >= 0) {
+					use_dma_import = true;
+					_LOG_DEBUG("DMA buffer import successful for buffer %u", n_buf);
+				} else {
+					_LOG_DEBUG("DMA-BUF import failed for buffer %u: %s", n_buf, strerror(errno));
+				}
+			} else {
+				_LOG_DEBUG("Amlogic platform detected, skipping DMA-BUF import for buffer %u", n_buf);
+			}
+
+			if (!use_dma_import) {
+				_LOG_DEBUG("Using manual buffer creation for buffer %u", n_buf);
+
+				// Manual buffer creation for all failed DMA imports or Amlogic
 				struct drm_mode_create_dumb create = {0};
 				create.width = run->mode.hdisplay;   // Use display resolution, not capture resolution
 				create.height = run->mode.vdisplay;  // Use display resolution, not capture resolution
-				create.bpp = 24; // Use 24-bit for compatibility
+				// For Amlogic platform with XRGB8888, we need 32-bit buffer
+				create.bpp = (run->platform == US_DRM_PLATFORM_AMLOGIC) ? 32 : 24;
+
+				_LOG_DEBUG("Creating fallback dumb buffer: %ux%u, bpp=%u",
+				          create.width, create.height, create.bpp);
+
 				if (drmIoctl(run->fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) < 0) {
 					_LOG_PERROR("Can't create fallback dumb buffer=%u", n_buf);
 					return -1;
 				}
 				buf->handle = create.handle;
-				
+				buf->dumb_created = true;
+
 				struct drm_mode_map_dumb map = {0};
 				map.handle = create.handle;
 				if (drmIoctl(run->fd, DRM_IOCTL_MODE_MAP_DUMB, &map) < 0) {
 					_LOG_PERROR("Can't get fallback buffer=%u map info", n_buf);
+					// Clean up on error
+					struct drm_mode_destroy_dumb destroy = {.handle = create.handle};
+					drmIoctl(run->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
 					return -1;
 				}
 				
@@ -695,17 +799,19 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 					run->fd, map.offset
 				)) == MAP_FAILED) {
 					_LOG_PERROR("Can't map fallback buffer=%u", n_buf);
+					// Clean up on error
+					struct drm_mode_destroy_dumb destroy = {.handle = create.handle};
+					drmIoctl(run->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
 					return -1;
 				}
 				memset(buf->data, 0, create.size);
 				buf->allocated = create.size;
-				buf->dumb_created = true;
 				
 				handles[0] = create.handle;
 				strides[0] = create.pitch;
-				format = DRM_FORMAT_RGB888; // Use RGB888 for fallback
-				_LOG_DEBUG("Created fallback buffer: %ux%u, bpp=%u, pitch=%u, size=%zu, handle=%u", 
-					create.width, create.height, create.bpp, create.pitch, create.size, create.handle);
+				// Format is already set based on platform at the beginning of this function
+				_LOG_DEBUG("Created fallback buffer: %ux%u, bpp=%u, pitch=%u, size=%llu, handle=%u",
+					create.width, create.height, create.bpp, create.pitch, (unsigned long long)create.size, create.handle);
 			} else {
 				handles[0] = buf->handle;
 				strides[0] = cap->run->stride;
@@ -714,10 +820,10 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 					case V4L2_PIX_FMT_RGB24: format = (DRM_FORMAT_BIG_ENDIAN ? DRM_FORMAT_BGR888 : DRM_FORMAT_RGB888); break;
 					case V4L2_PIX_FMT_BGR24: format = (DRM_FORMAT_BIG_ENDIAN ? DRM_FORMAT_RGB888 : DRM_FORMAT_BGR888); break;
 					case V4L2_PIX_FMT_YUYV: format = DRM_FORMAT_YUYV; break;
-					case V4L2_PIX_FMT_MJPEG: 
-						// MJPEG needs to be decoded first, use RGB888 as fallback
-						format = DRM_FORMAT_RGB888; 
-						_LOG_INFO("MJPEG format detected, will decode to RGB for display");
+					case V4L2_PIX_FMT_MJPEG:
+						// MJPEG needs to be decoded first, use XRGB8888 as fallback
+						format = DRM_FORMAT_XRGB8888;
+						_LOG_INFO("MJPEG format detected, will decode to XRGB8888 for display");
 						break;
 				}
 			}
@@ -725,11 +831,23 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 
 		int fb_ret = -1;
 		if (cap == NULL) {
-			// For STUB buffers, try original method first (drmModeAddFB2 with RGB888)
-			_LOG_DEBUG("Creating STUB framebuffer: %ux%u, format=0x%x, handle=%u, stride=%u", 
-				run->mode.hdisplay, run->mode.vdisplay, format, handles[0], strides[0]);
-			fb_ret = drmModeAddFB2(run->fd, run->mode.hdisplay, run->mode.vdisplay, 
-			                       format, handles, strides, offsets, &buf->id, 0);
+			// For STUB buffers, use different methods based on platform
+			if (run->platform == US_DRM_PLATFORM_AMLOGIC) {
+				// Amlogic: Use legacy AddFB for better compatibility
+				// For XRGB8888: depth=24 (RGB without padding), bpp=32 (4 bytes per pixel)
+				uint fb_depth = 24;
+				uint fb_bpp = 32;
+				_LOG_DEBUG("Creating Amlogic STUB framebuffer: %ux%u, depth=%u, bpp=%u, handle=%u, stride=%u",
+					run->mode.hdisplay, run->mode.vdisplay, fb_depth, fb_bpp, handles[0], strides[0]);
+				fb_ret = drmModeAddFB(run->fd, run->mode.hdisplay, run->mode.vdisplay,
+				                     fb_depth, fb_bpp, strides[0], handles[0], &buf->id);
+			} else {
+				// Other platforms: Use AddFB2 method
+				_LOG_DEBUG("Creating STUB framebuffer: %ux%u, format=0x%x, handle=%u, stride=%u",
+					run->mode.hdisplay, run->mode.vdisplay, format, handles[0], strides[0]);
+				fb_ret = drmModeAddFB2(run->fd, run->mode.hdisplay, run->mode.vdisplay,
+				                       format, handles, strides, offsets, &buf->id, 0);
+			}
 			
 			if (fb_ret != 0) {
 				// Original method failed, try fallback formats
@@ -798,11 +916,23 @@ static int _drm_init_buffers(us_drm_s *drm, const us_capture_s *cap) {
 				}
 			}
 		} else {
-			// For DMA buffers, use modern API with format-specific handling
-			_LOG_DEBUG("Creating DMA framebuffer: %ux%u, format=0x%x, handle=%u, stride=%u", 
-				run->mode.hdisplay, run->mode.vdisplay, format, handles[0], strides[0]);
-			fb_ret = drmModeAddFB2(run->fd, run->mode.hdisplay, run->mode.vdisplay, 
-			                       format, handles, strides, offsets, &buf->id, 0);
+			// For DMA buffers, use platform-specific API
+			if (run->platform == US_DRM_PLATFORM_AMLOGIC) {
+				// Amlogic: Use legacy AddFB for DMA buffers too
+				// For XRGB8888: depth=24, bpp=32
+				uint fb_depth = 24;
+				uint fb_bpp = 32;
+				_LOG_DEBUG("Creating Amlogic DMA framebuffer: %ux%u, depth=%u, bpp=%u, handle=%u, stride=%u",
+					cap->run->width, cap->run->height, fb_depth, fb_bpp, handles[0], strides[0]);
+				fb_ret = drmModeAddFB(run->fd, cap->run->width, cap->run->height,
+				                     fb_depth, fb_bpp, strides[0], handles[0], &buf->id);
+			} else {
+				// Other platforms: Use AddFB2 with format-specific handling
+				_LOG_DEBUG("Creating DMA framebuffer: %ux%u, format=0x%x, handle=%u, stride=%u",
+					cap->run->width, cap->run->height, format, handles[0], strides[0]);
+				fb_ret = drmModeAddFB2(run->fd, cap->run->width, cap->run->height,
+				                       format, handles, strides, offsets, &buf->id, 0);
+			}
 		}
 		
 		if (fb_ret) {
@@ -842,15 +972,27 @@ static int _drm_find_sink(us_drm_s *drm, uint width, uint height, float hz) {
 		US_SNPRINTF(port, 31, "%s-%u",
 			_connector_type_to_string(conn->connector_type),
 			conn->connector_type_id);
-		if (strcmp(port, drm->port) != 0) {
+
+		if (drm->port != NULL && strcmp(port, drm->port) != 0) {
 			drmModeFreeConnector(conn);
 			continue;
 		}
-		_LOG_INFO("Using connector %s: conn_type=%d, conn_type_id=%d",
-			drm->port, conn->connector_type, conn->connector_type_id);
+
+		if (drm->port == NULL) {
+			if (conn->connection != DRM_MODE_CONNECTED) {
+				drmModeFreeConnector(conn);
+				continue;
+			}
+			drm->port = strdup(port);
+			_LOG_INFO("Auto-detected connector %s: conn_type=%d, conn_type_id=%d",
+				port, conn->connector_type, conn->connector_type_id);
+		} else {
+			_LOG_INFO("Using connector %s: conn_type=%d, conn_type_id=%d",
+				drm->port, conn->connector_type, conn->connector_type_id);
+		}
 
 		if (conn->connection != DRM_MODE_CONNECTED) {
-			_LOG_ERROR("Connector for port %s has !DRM_MODE_CONNECTED", drm->port);
+			_LOG_ERROR("Connector for port %s has !DRM_MODE_CONNECTED", port);
 			drmModeFreeConnector(conn);
 			goto done;
 		}
@@ -880,6 +1022,10 @@ static int _drm_find_sink(us_drm_s *drm, uint width, uint height, float hz) {
 
 		run->conn_id = conn->connector_id;
 		memcpy(&run->mode, best, sizeof(drmModeModeInfo));
+
+		// Pre-calculate display stride for performance (XRGB8888 = 4 bytes per pixel)
+		run->display_stride = run->mode.hdisplay * 4;
+		_LOG_DEBUG("Pre-calculated display stride: %u (hdisplay=%u)", run->display_stride, run->mode.hdisplay);
 
 		drmModeFreeConnector(conn);
 		break;
@@ -1046,52 +1192,10 @@ static void _drm_calculate_center(us_drm_center_s *center, uint src_w, uint src_
 	}
 }
 
-static void _drm_copy_centered(u8 *dst_data, const u8 *src_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp) {
-	const uint src_bytes_per_pixel = 3; // RGB24/BGR24 source
-	const uint dst_bytes_per_pixel = dst_bpp / 8; // 目标格式的字节数
-	const uint src_stride = center->src_width * src_bytes_per_pixel;
-	
-	for (uint y = 0; y < center->src_height; ++y) {
-		const uint dst_y = center->offset_y + y;
-		if (dst_y >= center->dst_height) break;
-		
-		u8 *dst_row = dst_data + (dst_y * dst_stride) + (center->offset_x * dst_bytes_per_pixel);
-		const u8 *src_row = src_data + (y * src_stride);
-		
-		if (dst_bpp == 32) {
-			// Convert RGB24 to XRGB32 pixel by pixel
-			for (uint x = 0; x < center->src_width; ++x) {
-				const u8 *src_pixel = src_row + (x * src_bytes_per_pixel);
-				u8 *dst_pixel = dst_row + (x * dst_bytes_per_pixel);
-				
-				// RGB24 -> XRGB32: B, G, R, X
-				dst_pixel[0] = src_pixel[2]; // B
-				dst_pixel[1] = src_pixel[1]; // G  
-				dst_pixel[2] = src_pixel[0]; // R
-				dst_pixel[3] = 0xFF;         // X (alpha/unused)
-			}
-		} else if (dst_bpp == 24) {
-			// 原来的24位复制（保持兼容性）
-			memcpy(dst_row, src_row, center->src_width * src_bytes_per_pixel);
-		} else if (dst_bpp == 16) {
-			// Convert RGB24 to RGB565 pixel by pixel
-			for (uint x = 0; x < center->src_width; ++x) {
-				const u8 *src_pixel = src_row + (x * src_bytes_per_pixel);
-				u16 *dst_pixel = (u16*)(dst_row + (x * dst_bytes_per_pixel));
-				
-				// RGB24 -> RGB565: 5 bits R, 6 bits G, 5 bits B
-				u16 r = (src_pixel[0] >> 3) & 0x1F;
-				u16 g = (src_pixel[1] >> 2) & 0x3F;
-				u16 b = (src_pixel[2] >> 3) & 0x1F;
-				*dst_pixel = (r << 11) | (g << 5) | b;
-			}
-		}
-	}
-}
-
 int us_drm_expose_centered(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
 	us_drm_runtime_s *const run = drm->run;
 
+	// Common pre-checks for all platforms
 	assert(run->fd >= 0);
 	assert(run->opened == 0);
 	run->blank_at_ts = 0;
@@ -1103,46 +1207,303 @@ int us_drm_expose_centered(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
 	}
 	_drm_ensure_dpms_power(drm, true);
 
-	// 计算居中参数
+	// Dispatch to platform-specific implementation
+	switch (run->platform) {
+		case US_DRM_PLATFORM_RPI:
+			return _drm_expose_rpi_v4p_impl(drm, hw);
+		case US_DRM_PLATFORM_AMLOGIC:
+			return _drm_expose_amlogic_display_impl(drm, hw);
+		default:
+			_LOG_ERROR("Unsupported DRM platform for centered display");
+			return -1;
+	}
+}
+
+static us_drm_platform_e _detect_drm_platform(int fd) {
+	drmVersionPtr version = drmGetVersion(fd);
+	if (!version) {
+		_LOG_DEBUG("Can't get DRM version, using generic platform");
+		return US_DRM_PLATFORM_GENERIC;
+	}
+
+	us_drm_platform_e platform = US_DRM_PLATFORM_GENERIC;
+
+	_LOG_DEBUG("DRM driver: %s, version: %d.%d.%d",
+		version->name, version->version_major,
+		version->version_minor, version->version_patchlevel);
+
+	if (version->name) {
+		if (strstr(version->name, "vc4") != NULL) {
+			// Raspberry Pi VideoCore IV
+			platform = US_DRM_PLATFORM_RPI;
+		} else if (strstr(version->name, "meson") != NULL) {
+			// Amlogic Meson (S805, S912, etc.)
+			platform = US_DRM_PLATFORM_AMLOGIC;
+		}
+		// Add other platform detection as needed
+	}
+
+	drmFreeVersion(version);
+	return platform;
+}
+
+static void _drm_convert_yuyv_simple(const u8 *src_data, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h) {
+	(void)dst_bpp; (void)dst_w; (void)dst_h;
+	u8 *dst_offset = dst_data + (center->offset_y * dst_stride) + (center->offset_x * 4);
+	YUY2ToARGB(src_data, src_w * 2, dst_offset, dst_stride, src_w, src_h);
+}
+
+
+static void _drm_convert_rgb24(const u8 *src_data, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h) {
+	const uint bytes_per_pixel = dst_bpp / 8;
+	const uint src_stride = src_w * 3; // RGB24 = 3 bytes per pixel
+
+	for (uint y = 0; y < src_h && y < center->src_height && (y + center->offset_y) < dst_h; y++) {
+		const u8 *src_row = src_data + (y * src_stride);
+		u8 *dst_row = dst_data + ((y + center->offset_y) * dst_stride) + (center->offset_x * bytes_per_pixel);
+
+		for (uint x = 0; x < src_w && x < center->src_width && (x + center->offset_x) < dst_w; x++) {
+			const uint src_pos = x * 3;
+			if (src_pos + 2 >= src_stride) break;
+
+			u8 R = src_row[src_pos + 0];
+			u8 G = src_row[src_pos + 1];
+			u8 B = src_row[src_pos + 2];
+
+			u8 *dst_pixel = dst_row + (x * bytes_per_pixel);
+			if (bytes_per_pixel == 4) {
+				dst_pixel[0] = B; dst_pixel[1] = G; dst_pixel[2] = R; dst_pixel[3] = 0xFF;
+			} else {
+				dst_pixel[0] = R; dst_pixel[1] = G; dst_pixel[2] = B;
+			}
+		}
+	}
+}
+
+static void _drm_convert_bgr24(const u8 *src_data, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h) {
+	const uint bytes_per_pixel = dst_bpp / 8;
+	const uint src_stride = src_w * 3;
+
+	for (uint y = 0; y < src_h && y < center->src_height && (y + center->offset_y) < dst_h; y++) {
+		const u8 *src_row = src_data + (y * src_stride);
+		u8 *dst_row = dst_data + ((y + center->offset_y) * dst_stride) + (center->offset_x * bytes_per_pixel);
+
+		for (uint x = 0; x < src_w && x < center->src_width && (x + center->offset_x) < dst_w; x++) {
+			const uint src_pos = x * 3;
+			if (src_pos + 2 >= src_stride) break;
+
+			u8 B = src_row[src_pos + 0];
+			u8 G = src_row[src_pos + 1];
+			u8 R = src_row[src_pos + 2];
+
+			u8 *dst_pixel = dst_row + (x * bytes_per_pixel);
+			if (bytes_per_pixel == 4) {
+				dst_pixel[0] = B; dst_pixel[1] = G; dst_pixel[2] = R; dst_pixel[3] = 0xFF;
+			} else {
+				dst_pixel[0] = R; dst_pixel[1] = G; dst_pixel[2] = B;
+			}
+		}
+	}
+}
+
+static void _drm_convert_mjpeg(const u8 *src_data, size_t src_size, uint src_w, uint src_h, u8 *dst_data, const us_drm_center_s *center, uint dst_stride, uint dst_bpp, uint dst_w, uint dst_h) {
+	_LOG_DEBUG("Decoding MJPEG frame %ux%u (%zu bytes)", src_w, src_h, src_size);
+
+	// Create temporary frames for JPEG decoding
+	us_frame_s src_frame = {0};
+	us_frame_s decoded_frame = {0};
+
+	// Setup source frame with MJPEG data
+	src_frame.width = src_w;
+	src_frame.height = src_h;
+	src_frame.format = V4L2_PIX_FMT_MJPEG;
+	src_frame.used = src_size;
+	src_frame.allocated = src_size;
+	src_frame.data = (u8*)src_data; // Cast away const for compatibility
+	src_frame.grab_ts = us_get_now_monotonic();
+
+	// Try to decode MJPEG to RGB24
+	if (us_unjpeg(&src_frame, &decoded_frame, true) == 0 && decoded_frame.data != NULL) {
+		_LOG_DEBUG("MJPEG decoded successfully to %ux%u RGB24", decoded_frame.width, decoded_frame.height);
+
+		// Now convert the decoded RGB24 to display format
+		_drm_convert_rgb24(decoded_frame.data, decoded_frame.width, decoded_frame.height,
+			dst_data, center, dst_stride, dst_bpp, dst_w, dst_h);
+
+		// Clean up decoded frame
+		US_DELETE(decoded_frame.data, free);
+	} else {
+		_LOG_ERROR("MJPEG decoding failed, cannot display frame");
+		// Leave buffer black (already cleared) - don't show fake data
+	}
+}
+
+
+// ============================================================================
+// Platform-specific implementations
+// ============================================================================
+
+// Original Raspberry Pi V4P DRM implementation - uses DMA buffer import
+static int _drm_expose_rpi_v4p_impl(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
+	us_drm_runtime_s *const run = drm->run;
+
+	// Calculate centering parameters
 	us_drm_center_s center;
-	_drm_calculate_center(&center, 
+	_drm_calculate_center(&center,
 		hw->raw.width, hw->raw.height,
 		run->mode.hdisplay, run->mode.vdisplay);
 
-	if (!center.needs_center) {
-		// 源分辨率大于等于显示分辨率，显示错误信息
-		_LOG_ERROR("Source resolution %ux%u is larger than display %ux%u, using stub mode",
-			hw->raw.width, hw->raw.height, run->mode.hdisplay, run->mode.vdisplay);
-		return us_drm_expose_stub(drm, US_DRM_STUB_BAD_RESOLUTION, NULL);
+	// Safety checks
+	if (hw->buf.index >= run->n_bufs) {
+		_LOG_ERROR("Invalid buffer index %u (max: %u)", hw->buf.index, run->n_bufs);
+		return -1;
 	}
 
 	us_drm_buffer_s *const buf = &run->bufs[hw->buf.index];
+	if (!buf->data) {
+		_LOG_ERROR("Buffer data is NULL for buffer %u", hw->buf.index);
+		return -1;
+	}
 
 	run->has_vsync = false;
 
-	_LOG_DEBUG("Copying centered frame %ux%u to display %ux%u ...", 
-		hw->raw.width, hw->raw.height, run->mode.hdisplay, run->mode.vdisplay);
+	_LOG_DEBUG("RPI V4P: Exposing DMA buffer %u", hw->buf.index);
 
-	// 清空背景为黑色
-	memset(buf->data, 0, buf->allocated);
-
-	// 居中复制画面数据
-	const uint dst_stride = run->mode.hdisplay * (run->detected_bpp / 8);
-	_drm_copy_centered(buf->data, hw->raw.data, &center, dst_stride, run->detected_bpp);
-
-	_LOG_DEBUG("Exposing centered framebuffer n_buf=%u ...", hw->buf.index);
+	// Original V4P uses page flip with DMA buffers
 	const int retval = drmModePageFlip(
 		run->fd, run->crtc_id, buf->id,
-		DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_PAGE_FLIP_ASYNC,
-		buf);
+		DRM_MODE_PAGE_FLIP_EVENT, buf);
+
 	if (retval < 0) {
 		if (errno == EACCES || errno == EPERM) {
 			_LOG_DEBUG("Page flip permission denied (desktop environment active)");
 		} else {
-			_LOG_PERROR("Can't expose centered framebuffer n_buf=%u", hw->buf.index);
+			_LOG_PERROR("Can't expose V4P framebuffer n_buf=%u", hw->buf.index);
 		}
+	} else {
+		_LOG_DEBUG("V4P framebuffer exposed successfully");
 	}
-	_LOG_DEBUG("Exposed centered framebuffer n_buf=%u", hw->buf.index);
 
 	return retval;
+}
+
+// New Amlogic display implementation - uses format conversion and SetCRTC
+static int _drm_expose_amlogic_display_impl(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
+	us_drm_runtime_s *const run = drm->run;
+
+	// Calculate centering parameters
+	us_drm_center_s center;
+	_drm_calculate_center(&center,
+		hw->raw.width, hw->raw.height,
+		run->mode.hdisplay, run->mode.vdisplay);
+
+	if (!center.needs_center) {
+		_LOG_ERROR("Source resolution %ux%u is larger than display %ux%u",
+			hw->raw.width, hw->raw.height, run->mode.hdisplay, run->mode.vdisplay);
+		return us_drm_expose_stub(drm, US_DRM_STUB_BAD_RESOLUTION, NULL);
+	}
+
+	// Safety checks
+	if (hw->buf.index >= run->n_bufs) {
+		_LOG_ERROR("Invalid buffer index %u (max: %u)", hw->buf.index, run->n_bufs);
+		return -1;
+	}
+
+	us_drm_buffer_s *const buf = &run->bufs[hw->buf.index];
+	if (!buf->data || buf->allocated == 0) {
+		_LOG_ERROR("Invalid buffer %u for Amlogic display", hw->buf.index);
+		return -1;
+	}
+
+	run->has_vsync = false;
+
+	// Check for valid frame data
+	if (!hw->raw.data || hw->raw.used == 0) {
+		_LOG_DEBUG("No valid frame data available, skipping display");
+		return -1;
+	}
+
+	// Clear buffer only if resolution changed (for borders)
+	// For full-screen display, skip memset - libyuv will overwrite entire buffer
+	static uint last_src_w = 0, last_src_h = 0;
+	const bool resolution_changed = (last_src_w != hw->raw.width || last_src_h != hw->raw.height);
+	const bool is_fullscreen = (hw->raw.width == run->mode.hdisplay && hw->raw.height == run->mode.vdisplay);
+
+	if (resolution_changed && !is_fullscreen) {
+		memset(buf->data, 0, buf->allocated);
+		last_src_w = hw->raw.width;
+		last_src_h = hw->raw.height;
+	}
+
+	// Convert frame to display format
+	const uint actual_bpp = 32; // XRGB8888 for Amlogic
+	const uint dst_stride = run->display_stride; // Pre-calculated in init
+
+	// Log frame conversion only once per second to reduce overhead
+	static uint frame_counter = 0;
+	static uint last_logged_format = 0;
+	const bool should_log = ((frame_counter++ % 60) == 0) || (last_logged_format != hw->raw.format);
+
+	if (should_log) {
+		const char *format_name = "UNKNOWN";
+		switch (hw->raw.format) {
+			case V4L2_PIX_FMT_YUYV: format_name = "YUYV"; break;
+			case V4L2_PIX_FMT_RGB24: format_name = "RGB24"; break;
+			case V4L2_PIX_FMT_BGR24: format_name = "BGR24"; break;
+			case V4L2_PIX_FMT_MJPEG: format_name = "MJPEG"; break;
+			case V4L2_PIX_FMT_JPEG: format_name = "JPEG"; break;
+		}
+		_LOG_DEBUG("Amlogic: Converting %s %ux%u → display %ux%u",
+			format_name, hw->raw.width, hw->raw.height, run->mode.hdisplay, run->mode.vdisplay);
+		last_logged_format = hw->raw.format;
+	}
+
+	switch (hw->raw.format) {
+		case V4L2_PIX_FMT_YUYV:
+			_drm_convert_yuyv_simple(hw->raw.data, hw->raw.width, hw->raw.height,
+				buf->data, &center, dst_stride, actual_bpp, run->mode.hdisplay, run->mode.vdisplay);
+			break;
+
+		case V4L2_PIX_FMT_RGB24:
+			_drm_convert_rgb24(hw->raw.data, hw->raw.width, hw->raw.height,
+				buf->data, &center, dst_stride, actual_bpp, run->mode.hdisplay, run->mode.vdisplay);
+			break;
+
+		case V4L2_PIX_FMT_BGR24:
+			_drm_convert_bgr24(hw->raw.data, hw->raw.width, hw->raw.height,
+				buf->data, &center, dst_stride, actual_bpp, run->mode.hdisplay, run->mode.vdisplay);
+			break;
+
+		case V4L2_PIX_FMT_MJPEG:
+		case V4L2_PIX_FMT_JPEG:
+			_drm_convert_mjpeg(hw->raw.data, hw->raw.used, hw->raw.width, hw->raw.height,
+				buf->data, &center, dst_stride, actual_bpp, run->mode.hdisplay, run->mode.vdisplay);
+			break;
+
+		default:
+			_LOG_ERROR("Unsupported format 0x%08x for Amlogic display", hw->raw.format);
+			return -1;
+	}
+
+	// Display using SetCRTC (more compatible than page flip for Amlogic)
+	const int retval = drmModeSetCrtc(run->fd, run->crtc_id, buf->id,
+		0, 0, &run->conn_id, 1, &run->mode);
+
+	if (retval < 0) {
+		_LOG_PERROR("Can't set CRTC for Amlogic framebuffer n_buf=%u", hw->buf.index);
+	} else {
+		_LOG_DEBUG("Amlogic framebuffer displayed successfully");
+	}
+
+	return retval;
+}
+
+
+// Public API functions for platform-specific implementations
+int us_drm_expose_rpi_v4p(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
+	return _drm_expose_rpi_v4p_impl(drm, hw);
+}
+
+int us_drm_expose_amlogic_display(us_drm_s *drm, const us_capture_hwbuf_s *hw) {
+	return _drm_expose_amlogic_display_impl(drm, hw);
 }
