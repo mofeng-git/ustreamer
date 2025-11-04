@@ -109,9 +109,7 @@ typedef struct {
 	char			*h264_m2m_path;
 
 #	ifdef WITH_FFMPEG
-	char			*h264_preset;
 	char			*h264_hwenc;
-	bool			h264_hwenc_fallback;
 #	endif
 
 #	if defined(WITH_DRM) || defined(WITH_V4P)

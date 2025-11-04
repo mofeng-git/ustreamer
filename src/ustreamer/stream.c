@@ -166,7 +166,7 @@ void us_stream_loop(us_stream_s *stream) {
 	us_capture_s *const cap = stream->cap;
 
 	atomic_store(&run->http->last_request_ts, us_get_now_monotonic());
-	printf("type:%d",stream->enc->type);
+    // 避免同步 stdout 输出造成抖动；如需查看请开启 DEBUG 级别日志
 	if (stream->h264_sink != NULL ) {
 		run->h264_tmp_src = us_frame_init();
 		run->h264_dest = us_frame_init();
@@ -223,8 +223,8 @@ void us_stream_loop(us_stream_s *stream) {
 		
 		if (error != US_HWENC_OK) {
 			US_LOG_ERROR("H264: Failed to initialize FFmpeg encoder: %s", us_hwenc_error_string(error));
-			if (stream->h264_hwenc_fallback && hwenc_type != US_HWENC_LIBX264) {
-				US_LOG_INFO("H264: Falling back to software encoding ...");
+			if (hwenc_type != US_HWENC_LIBX264) {
+				US_LOG_INFO("H264: Falling back to software encoding (libx264) ...");
 				error = us_ffmpeg_hwenc_create(&run->ffmpeg_enc, US_HWENC_LIBX264,
 					cap->width, cap->height, stream->h264_bitrate, stream->h264_gop);
 				if (error == US_HWENC_OK) {

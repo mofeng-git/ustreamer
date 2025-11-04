@@ -233,20 +233,26 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 		return US_HWENC_ERROR_MEMORY;
 	}
 
-	// 配置编码器参数
-	enc->ctx->width = width;
-	enc->ctx->height = height;
-	enc->ctx->time_base = (AVRational){1, 60};
-	enc->ctx->framerate = (AVRational){60, 1};
-	enc->ctx->bit_rate = bitrate_kbps * 1000;
-	enc->ctx->gop_size = gop_size;
-	enc->ctx->max_b_frames = 0;
-	// 根据编码器类型设置像素格式
-	if (type == US_HWENC_VAAPI || type == US_HWENC_RKMPP) {
-		enc->ctx->pix_fmt = AV_PIX_FMT_NV12;
-	} else {
-		enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-	}
+    // 配置编码器参数
+    enc->ctx->width = width;
+    enc->ctx->height = height;
+    enc->ctx->time_base = (AVRational){1, 60};
+    enc->ctx->framerate = (AVRational){60, 1};
+    enc->ctx->bit_rate = bitrate_kbps * 1000;
+    enc->ctx->gop_size = gop_size;
+    enc->ctx->max_b_frames = 0;
+    // 根据编码器类型设置像素格式（ctx）与软帧像素格式（sw_fmt）
+    enum AVPixelFormat sw_fmt = AV_PIX_FMT_YUV420P;
+    if (type == US_HWENC_VAAPI) {
+        enc->ctx->pix_fmt = AV_PIX_FMT_VAAPI;
+        sw_fmt = AV_PIX_FMT_NV12; // 软帧用于上传 VAAPI
+    } else if (type == US_HWENC_RKMPP) {
+        enc->ctx->pix_fmt = AV_PIX_FMT_NV12; // rkmpp接受NV12软件帧
+        sw_fmt = AV_PIX_FMT_NV12;
+    } else {
+        enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+        sw_fmt = AV_PIX_FMT_YUV420P;
+    }
 
 	// 硬件设备初始化
 	const char *hw_device_type = _get_hw_device_type(type);
@@ -281,15 +287,49 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 		}
 	}
 
-	// 设置编码器选项
-	AVDictionary *opts = NULL;
-	if (type == US_HWENC_LIBX264) {
-		// libx264软件编码器选项 - 基础设置
-		av_dict_set(&opts, "preset", "ultrafast", 0);
-		av_dict_set(&opts, "tune", "zerolatency", 0);
-		av_dict_set(&opts, "profile", "baseline", 0);
-		av_dict_set(&opts, "crf", "23", 0);  // 默认质量
-	} else if (type == US_HWENC_VAAPI) {
+    // 设置编码器选项
+    AVDictionary *opts = NULL;
+    if (type == US_HWENC_LIBX264) {
+        // libx264 软件编码器 - 低延迟高吞吐默认值
+        // 说明：这里采用 ultrafast + zerolatency + sliced threads 并将复杂度参数降到最低，
+        // 同时根据 CPU 核数设置线程数，默认 8 slices 以提升并行度。
+        const char *use_preset = "ultrafast";
+        int thread_count = _get_optimal_threads_by_preset(use_preset, width, height);
+
+        av_dict_set(&opts, "preset", use_preset, 0);
+        av_dict_set(&opts, "tune", "zerolatency,fastdecode", 0);
+        av_dict_set(&opts, "profile", "baseline", 0);
+
+        // 线程与切片并行
+        char threads_str[8];
+        snprintf(threads_str, sizeof(threads_str), "%d", thread_count);
+        av_dict_set(&opts, "threads", threads_str, 0);
+        av_dict_set(&opts, "sliced_threads", "1", 0);
+        av_dict_set(&opts, "thread_type", "slice", 0);
+        av_dict_set(&opts, "slices", "8", 0); // 默认 8 片；较低端 SoC 提升明显
+
+        // 低延迟相关：
+        av_dict_set(&opts, "rc_lookahead", "0", 0);
+        av_dict_set(&opts, "refs", "1", 0);
+        av_dict_set(&opts, "weightp", "0", 0);
+        av_dict_set(&opts, "scenecut", "0", 0);
+        av_dict_set(&opts, "open_gop", "0", 0);
+        // slice 大小限制可降低排队延迟（可按需调大）：
+        av_dict_set(&opts, "slice_max_size", "1500", 0);
+
+        // 质量/复杂度：保持较低以换取速度
+        av_dict_set(&opts, "crf", "28", 0);
+        av_dict_set(&opts, "me_method", "dia", 0);
+        av_dict_set(&opts, "subme", "1", 0);
+        av_dict_set(&opts, "trellis", "0", 0);
+        av_dict_set(&opts, "mixed_refs", "0", 0);
+        av_dict_set(&opts, "8x8dct", "0", 0);
+        av_dict_set(&opts, "cabac", "0", 0);
+        av_dict_set(&opts, "deblock", "0:0", 0);
+
+        US_LOG_INFO("HWENC: libx264 tuned: preset=%s threads=%d slices=8 zerolatency fastdecode",
+                    use_preset, thread_count);
+    } else if (type == US_HWENC_VAAPI) {
 		// VAAPI硬件编码器选项 - 使用CBR模式确保码率生效
 		av_dict_set(&opts, "rc_mode", "CBR", 0);               // 恒定码率模式
 		av_dict_set(&opts, "packed_headers", "none", 0);       // 禁用打包头
@@ -367,8 +407,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 		}
 	}
 	
-	// 打开编码器
-	int ret = avcodec_open2(enc->ctx, codec, &opts);
+    // 打开编码器
+    int ret = avcodec_open2(enc->ctx, codec, &opts);
 	av_dict_free(&opts);
 	if (ret < 0) {
 		char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -387,32 +427,41 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 		return US_HWENC_ERROR_ENCODER_INIT;
 	}
 
-	// 分配帧和包
-	enc->frame = av_frame_alloc();
-	enc->pkt = av_packet_alloc();
-	if (!enc->frame || !enc->pkt) {
-		US_LOG_ERROR("HWENC: Failed to allocate frame or packet");
-		us_ffmpeg_hwenc_destroy(enc);
-		return US_HWENC_ERROR_MEMORY;
-	}
+    // 分配帧和包（复用对象，不在每帧分配）
+    enc->frame = av_frame_alloc();
+    enc->hw_frame = NULL;
+    enc->pkt = av_packet_alloc();
+    if (!enc->frame || !enc->pkt) {
+        US_LOG_ERROR("HWENC: Failed to allocate frame or packet");
+        us_ffmpeg_hwenc_destroy(enc);
+        return US_HWENC_ERROR_MEMORY;
+    }
 
-	// 设置帧参数
-	enc->frame->format = enc->ctx->pix_fmt;
-	enc->frame->width = width;
-	enc->frame->height = height;
+    // 设置软帧参数
+    enc->frame->format = sw_fmt;
+    enc->frame->width = width;
+    enc->frame->height = height;
 
-	// 对于VAAPI硬件编码，不在初始化时分配帧缓冲（按需分配）
-	// 对于软件编码，预分配缓冲区以提高性能
-	if (type != US_HWENC_VAAPI) {
-		ret = av_frame_get_buffer(enc->frame, 32);
-		if (ret < 0) {
-			char errbuf[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(ret, errbuf, sizeof(errbuf));
-			US_LOG_ERROR("HWENC: Failed to allocate frame buffer: %s", errbuf);
-			us_ffmpeg_hwenc_destroy(enc);
-			return US_HWENC_ERROR_MEMORY;
-		}
-	}
+    // 统一预分配软帧缓冲区以便复用
+    enc->sw_alignment = (type == US_HWENC_RKMPP) ? 64 : 32;
+    ret = av_frame_get_buffer(enc->frame, enc->sw_alignment);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        US_LOG_ERROR("HWENC: Failed to allocate frame buffer: %s", errbuf);
+        us_ffmpeg_hwenc_destroy(enc);
+        return US_HWENC_ERROR_MEMORY;
+    }
+
+    // VAAPI：分配可复用的硬件帧对象（底层surface按帧从池获取）
+    if (type == US_HWENC_VAAPI) {
+        enc->hw_frame = av_frame_alloc();
+        if (!enc->hw_frame) {
+            US_LOG_ERROR("HWENC: Failed to allocate VAAPI hw_frame container");
+            us_ffmpeg_hwenc_destroy(enc);
+            return US_HWENC_ERROR_MEMORY;
+        }
+    }
 
 	// 软件缩放器将在编码时根据输入格式动态创建
 	enc->sws_ctx = NULL;
@@ -423,15 +472,12 @@ us_hwenc_error_e us_ffmpeg_hwenc_create(us_ffmpeg_hwenc_s **encoder,
 	US_LOG_INFO("HWENC: Hardware encoder created successfully (%s, %dx%d @ %u kbps)",
 	           enc->codec_name, width, height, bitrate_kbps);
 
-	return US_HWENC_OK;
+    return US_HWENC_OK;
 }
 
 // 扩展版本，支持libx264预设参数
-us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
-                                                   us_hwenc_type_e type,
-                                                   int width, int height,
-                                                   uint bitrate_kbps, uint gop_size,
-                                                   const char *preset, const char *tune, const char *profile) {
+/* Removed: us_ffmpeg_hwenc_create_with_preset (统一采用固定的低延迟高吞吐参数) */
+#if 0
 	if (!encoder) {
 		US_LOG_ERROR("HWENC: Encoder pointer is NULL");
 		return US_HWENC_ERROR_INVALID_PARAM;
@@ -492,20 +538,26 @@ us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
 		return US_HWENC_ERROR_MEMORY;
 	}
 
-	// 配置编码器参数
-	enc->ctx->width = width;
-	enc->ctx->height = height;
-	enc->ctx->time_base = (AVRational){1, 60};
-	enc->ctx->framerate = (AVRational){60, 1};
-	enc->ctx->bit_rate = bitrate_kbps * 1000;
-	enc->ctx->gop_size = gop_size;
-	enc->ctx->max_b_frames = 0;
-	// 根据编码器类型设置像素格式
-	if (type == US_HWENC_VAAPI || type == US_HWENC_RKMPP) {
-		enc->ctx->pix_fmt = AV_PIX_FMT_NV12;
-	} else {
-		enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-	}
+    // 配置编码器参数
+    enc->ctx->width = width;
+    enc->ctx->height = height;
+    enc->ctx->time_base = (AVRational){1, 60};
+    enc->ctx->framerate = (AVRational){60, 1};
+    enc->ctx->bit_rate = bitrate_kbps * 1000;
+    enc->ctx->gop_size = gop_size;
+    enc->ctx->max_b_frames = 0;
+    // 根据编码器类型设置像素格式（ctx）与软帧像素格式（sw_fmt）
+    enum AVPixelFormat sw_fmt = AV_PIX_FMT_YUV420P;
+    if (type == US_HWENC_VAAPI) {
+        enc->ctx->pix_fmt = AV_PIX_FMT_VAAPI;
+        sw_fmt = AV_PIX_FMT_NV12;
+    } else if (type == US_HWENC_RKMPP) {
+        enc->ctx->pix_fmt = AV_PIX_FMT_NV12;
+        sw_fmt = AV_PIX_FMT_NV12;
+    } else {
+        enc->ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+        sw_fmt = AV_PIX_FMT_YUV420P;
+    }
 
 	// 设置编码器选项
 	AVDictionary *opts = NULL;
@@ -569,11 +621,20 @@ us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
 			av_dict_set(&opts, "trellis", "2", 0);  // 完整trellis量化
 		}
 		
-		// 实时编码通用优化（适用于所有preset）
-		av_dict_set(&opts, "slice_max_size", "1500", 0);  // 限制slice大小减少延迟
-		av_dict_set(&opts, "intra_refresh", "1", 0);     // 启用帧内刷新
-		av_dict_set(&opts, "sliced_threads", "1", 0);    // 启用slice级多线程
-		av_dict_set(&opts, "thread_type", "slice", 0);   // 优化线程类型
+        // 实时编码通用优化（适用于所有preset）
+        av_dict_set(&opts, "slice_max_size", "1500", 0);  // 限制slice大小减少延迟
+        av_dict_set(&opts, "intra_refresh", "1", 0);     // 启用帧内刷新
+        av_dict_set(&opts, "sliced_threads", "1", 0);    // 启用slice级多线程
+        av_dict_set(&opts, "thread_type", "slice", 0);   // 优化线程类型
+        av_dict_set(&opts, "slices", "8", 0);            // 默认 8 片
+        // 低延迟相关（与外部参数不冲突时才设置保守默认）
+        if (!preset || strcmp(use_preset, "ultrafast") == 0) {
+            av_dict_set(&opts, "weightp", "0", 0);
+            av_dict_set(&opts, "scenecut", "0", 0);
+            av_dict_set(&opts, "open_gop", "0", 0);
+            av_dict_set(&opts, "rc_lookahead", "0", 0);
+            av_dict_set(&opts, "refs", "1", 0);
+        }
 		
 		US_LOG_INFO("HWENC: Optimized libx264 with preset=%s (%d threads, %d CPU cores), tune=%s, profile=%s", 
 		           use_preset, thread_count, _get_cpu_core_count(), use_tune, use_profile);
@@ -675,8 +736,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
 		}
 	}
 
-	// 打开编码器
-	int ret = avcodec_open2(enc->ctx, codec, &opts);
+    // 打开编码器
+    int ret = avcodec_open2(enc->ctx, codec, &opts);
 	av_dict_free(&opts);
 	if (ret < 0) {
 		char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -694,31 +755,40 @@ us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
 		return US_HWENC_ERROR_ENCODER_INIT;
 	}
 
-	// 分配帧和包
-	enc->frame = av_frame_alloc();
-	enc->pkt = av_packet_alloc();
-	if (!enc->frame || !enc->pkt) {
-		US_LOG_ERROR("HWENC: Failed to allocate frame or packet");
-		us_ffmpeg_hwenc_destroy(enc);
-		return US_HWENC_ERROR_MEMORY;
-	}
+    // 分配帧和包（复用对象，不在每帧分配）
+    enc->frame = av_frame_alloc();
+    enc->hw_frame = NULL;
+    enc->pkt = av_packet_alloc();
+    if (!enc->frame || !enc->pkt) {
+        US_LOG_ERROR("HWENC: Failed to allocate frame or packet");
+        us_ffmpeg_hwenc_destroy(enc);
+        return US_HWENC_ERROR_MEMORY;
+    }
 
-	// 设置帧参数
-	enc->frame->format = enc->ctx->pix_fmt;
-	enc->frame->width = width;
-	enc->frame->height = height;
+    // 设置软帧参数
+    enc->frame->format = sw_fmt;
+    enc->frame->width = width;
+    enc->frame->height = height;
 
-	// 对于VAAPI硬件编码，不在初始化时分配帧缓冲
-	if (type != US_HWENC_VAAPI) {
-		ret = av_frame_get_buffer(enc->frame, 32);
-		if (ret < 0) {
-			char errbuf[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(ret, errbuf, sizeof(errbuf));
-			US_LOG_ERROR("HWENC: Failed to allocate frame buffer: %s", errbuf);
-			us_ffmpeg_hwenc_destroy(enc);
-			return US_HWENC_ERROR_MEMORY;
-		}
-	}
+    // 统一预分配软帧缓冲区以便复用
+    enc->sw_alignment = (type == US_HWENC_RKMPP) ? 64 : 32;
+    ret = av_frame_get_buffer(enc->frame, enc->sw_alignment);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        US_LOG_ERROR("HWENC: Failed to allocate frame buffer: %s", errbuf);
+        us_ffmpeg_hwenc_destroy(enc);
+        return US_HWENC_ERROR_MEMORY;
+    }
+
+    if (type == US_HWENC_VAAPI) {
+        enc->hw_frame = av_frame_alloc();
+        if (!enc->hw_frame) {
+            US_LOG_ERROR("HWENC: Failed to allocate VAAPI hw_frame container");
+            us_ffmpeg_hwenc_destroy(enc);
+            return US_HWENC_ERROR_MEMORY;
+        }
+    }
 
 	// 软件缩放器将在编码时根据输入格式动态创建
 	enc->sws_ctx = NULL;
@@ -729,9 +799,7 @@ us_hwenc_error_e us_ffmpeg_hwenc_create_with_preset(us_ffmpeg_hwenc_s **encoder,
 	US_LOG_INFO("HWENC: Hardware encoder created successfully (%s, %dx%d @ %u kbps)",
 	           enc->codec_name, width, height, bitrate_kbps);
 
-	return US_HWENC_OK;
-}
-
+#endif // end of removed preset-based constructor
 // 编码一帧
 us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
                                          const us_frame_s *src,
@@ -772,14 +840,17 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		output_format = AV_PIX_FMT_NV12;
 	}
 	
-	if (src->format == V4L2_PIX_FMT_RGB24) {
-		input_format = AV_PIX_FMT_RGB24;
-	} else if (src->format == V4L2_PIX_FMT_BGR24) {
-		input_format = AV_PIX_FMT_BGR24;
-	} else if (src->format == V4L2_PIX_FMT_YUYV) {
-		input_format = AV_PIX_FMT_YUYV422;
-	} else if (src->format == V4L2_PIX_FMT_NV12) {
-		input_format = AV_PIX_FMT_NV12;
+    if (src->format == V4L2_PIX_FMT_RGB24) {
+        input_format = AV_PIX_FMT_RGB24;
+    } else if (src->format == V4L2_PIX_FMT_BGR24) {
+        input_format = AV_PIX_FMT_BGR24;
+    } else if (src->format == V4L2_PIX_FMT_YUYV) {
+        input_format = AV_PIX_FMT_YUYV422;
+    } else if (src->format == V4L2_PIX_FMT_YUV420 || src->format == V4L2_PIX_FMT_YVU420) {
+        // 支持 I420/YV12 作为输入
+        input_format = AV_PIX_FMT_YUV420P;
+    } else if (src->format == V4L2_PIX_FMT_NV12) {
+        input_format = AV_PIX_FMT_NV12;
 	} else if (src->format == V4L2_PIX_FMT_NV16) {
 		input_format = AV_PIX_FMT_NV16;
 	} else if (src->format == V4L2_PIX_FMT_NV21) {
@@ -795,14 +866,28 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	// 软件缩放器将仅在需要 sws_scale 时按需创建
 
 	// 准备输入数据
-	const uint8_t *src_data[4] = {src->data, NULL, NULL, NULL};
-	int src_linesize[4] = {(int)src->stride, 0, 0, 0};
+    const uint8_t *src_data[4] = {src->data, NULL, NULL, NULL};
+    int src_linesize[4] = {(int)src->stride, 0, 0, 0};
 	
 	// 对于NV格式，需要设置UV平面数据指针
-	if (src->format == V4L2_PIX_FMT_NV12 || src->format == V4L2_PIX_FMT_NV21) {
-		// NV12/NV21: UV平面在Y平面之后，高度为Y平面的一半
-		src_data[1] = src->data + src->stride * encoder->height;
-		src_linesize[1] = (int)src->stride; // UV平面stride与Y平面相同
+    if (src->format == V4L2_PIX_FMT_YUV420 || src->format == V4L2_PIX_FMT_YVU420) {
+        // I420/YV12：三平面，U/V 宽高为一半
+        const int y_size = encoder->height * encoder->width;
+        src_data[0] = src->data;                         // Y
+        src_linesize[0] = (int)src->stride;
+        if (src->format == V4L2_PIX_FMT_YUV420) {
+            src_data[1] = src->data + y_size;            // U
+            src_data[2] = src->data + y_size + (y_size/4); // V
+        } else { // YVU420 (YV12)
+            src_data[2] = src->data + y_size;            // V
+            src_data[1] = src->data + y_size + (y_size/4); // U
+        }
+        src_linesize[1] = (int)(src->stride / 2);
+        src_linesize[2] = (int)(src->stride / 2);
+    } else if (src->format == V4L2_PIX_FMT_NV12 || src->format == V4L2_PIX_FMT_NV21) {
+        // NV12/NV21: UV平面在Y平面之后，高度为Y平面的一半
+        src_data[1] = src->data + src->stride * encoder->height;
+        src_linesize[1] = (int)src->stride; // UV平面stride与Y平面相同
 	} else if (src->format == V4L2_PIX_FMT_NV16) {
 		// NV16: UV平面在Y平面之后，高度与Y平面相同
 		src_data[1] = src->data + src->stride * encoder->height;
@@ -813,53 +898,42 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		src_linesize[1] = (int)src->stride * 2;
 	}
 
-	// 分配软件帧缓冲区
-	AVFrame *yuv_frame = av_frame_alloc();
-	if (!yuv_frame) {
-		pthread_mutex_unlock(&encoder->mutex);
-		return US_HWENC_ERROR_MEMORY;
-	}
+    // 复用已分配的软帧缓冲区
+    AVFrame *yuv_frame = encoder->frame;
+    yuv_frame->format = output_format; // 确保与期望一致（VAAPI/RKMPP=NV12，否则YUV420P）
+    yuv_frame->width = encoder->width;
+    yuv_frame->height = encoder->height;
+    int ret = av_frame_make_writable(yuv_frame);
+    if (ret < 0) {
+        pthread_mutex_unlock(&encoder->mutex);
+        return US_HWENC_ERROR_MEMORY;
+    }
 
-	yuv_frame->format = output_format;
-	yuv_frame->width = encoder->width;
-	yuv_frame->height = encoder->height;
-
-	// RKMPP需要64字节对齐的缓冲区
-	int alignment = (encoder->type == US_HWENC_RKMPP) ? 64 : 32;
-	int ret = av_frame_get_buffer(yuv_frame, alignment);
-	if (ret < 0) {
-		av_frame_free(&yuv_frame);
-		pthread_mutex_unlock(&encoder->mutex);
-		return US_HWENC_ERROR_MEMORY;
-	}
-
-	// 对于RKMPP，验证linesize是否满足要求
-	if (encoder->type == US_HWENC_RKMPP) {
-		// 计算每个平面的最小字节宽度
-		int y_bytewidth = encoder->width;
-		int uv_bytewidth = encoder->width; // NV12格式UV平面宽度与Y相同
-		
-		// 检查Y平面linesize
-		if (abs(yuv_frame->linesize[0]) < y_bytewidth) {
-			US_LOG_ERROR("HWENC: RKMPP Y plane linesize (%d) < bytewidth (%d)", 
-			           abs(yuv_frame->linesize[0]), y_bytewidth);
-			av_frame_free(&yuv_frame);
-			pthread_mutex_unlock(&encoder->mutex);
-			return US_HWENC_ERROR_MEMORY;
-		}
-		
-		// 检查UV平面linesize (NV12格式)
-		if (output_format == AV_PIX_FMT_NV12 && abs(yuv_frame->linesize[1]) < uv_bytewidth) {
-			US_LOG_ERROR("HWENC: RKMPP UV plane linesize (%d) < bytewidth (%d)", 
-			           abs(yuv_frame->linesize[1]), uv_bytewidth);
-			av_frame_free(&yuv_frame);
-			pthread_mutex_unlock(&encoder->mutex);
-			return US_HWENC_ERROR_MEMORY;
-		}
-		
-		US_LOG_DEBUG("HWENC: RKMPP frame allocated - Y linesize: %d, UV linesize: %d", 
-		           yuv_frame->linesize[0], yuv_frame->linesize[1]);
-	}
+    // 对于RKMPP，验证linesize是否满足要求
+    if (encoder->type == US_HWENC_RKMPP) {
+        // 计算每个平面的最小字节宽度
+        int y_bytewidth = encoder->width;
+        int uv_bytewidth = encoder->width; // NV12格式UV平面宽度与Y相同
+        
+        // 检查Y平面linesize
+        if (abs(yuv_frame->linesize[0]) < y_bytewidth) {
+            US_LOG_ERROR("HWENC: RKMPP Y plane linesize (%d) < bytewidth (%d)", 
+                       abs(yuv_frame->linesize[0]), y_bytewidth);
+            pthread_mutex_unlock(&encoder->mutex);
+            return US_HWENC_ERROR_MEMORY;
+        }
+        
+        // 检查UV平面linesize (NV12格式)
+        if (output_format == AV_PIX_FMT_NV12 && abs(yuv_frame->linesize[1]) < uv_bytewidth) {
+            US_LOG_ERROR("HWENC: RKMPP UV plane linesize (%d) < bytewidth (%d)", 
+                       abs(yuv_frame->linesize[1]), uv_bytewidth);
+            pthread_mutex_unlock(&encoder->mutex);
+            return US_HWENC_ERROR_MEMORY;
+        }
+        
+        US_LOG_DEBUG("HWENC: RKMPP frame allocated - Y linesize: %d, UV linesize: %d", 
+                   yuv_frame->linesize[0], yuv_frame->linesize[1]);
+    }
 
 	// 格式转换或直接拷贝优化
 	if (input_format == output_format && input_format == AV_PIX_FMT_NV12) {
@@ -883,22 +957,21 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 			src_uv += src_linesize[1];
 			dst_uv += yuv_frame->linesize[1];
 		}
-	} else {
-		// 使用优化的sws_scale进行格式转换（多线程 + 快速算法）
-		if (!encoder->sws_ctx) {
-			// 60fps优化：使用最快的缩放算法和多线程
-			encoder->sws_ctx = sws_getContext(
-				encoder->width, encoder->height, input_format,
-				encoder->width, encoder->height, output_format,
-				SWS_FAST_BILINEAR,  // 最快的缩放算法
-				NULL, NULL, NULL);
-			
-			if (!encoder->sws_ctx) {
-				av_frame_free(&yuv_frame);
-				pthread_mutex_unlock(&encoder->mutex);
-				US_LOG_ERROR("HWENC: Failed to create software scaler");
-				return US_HWENC_ERROR_MEMORY;
-			}
+    } else {
+        // 使用优化的sws_scale进行格式转换（多线程 + 快速算法）
+        if (!encoder->sws_ctx) {
+            // 60fps优化：使用最快的缩放算法和多线程
+            encoder->sws_ctx = sws_getContext(
+                encoder->width, encoder->height, input_format,
+                encoder->width, encoder->height, output_format,
+                SWS_FAST_BILINEAR,  // 最快的缩放算法
+                NULL, NULL, NULL);
+            
+            if (!encoder->sws_ctx) {
+                pthread_mutex_unlock(&encoder->mutex);
+                US_LOG_ERROR("HWENC: Failed to create software scaler");
+                return US_HWENC_ERROR_MEMORY;
+            }
 			
 			// 启用多线程处理以提高RGB24->NV12转换性能
 			int thread_count = _get_cpu_core_count();
@@ -915,8 +988,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 			yuv_frame->data, yuv_frame->linesize);
 	}
 
-	// 设置帧时间戳
-	yuv_frame->pts = encoder->frame_number;
+    // 设置帧时间戳
+    yuv_frame->pts = encoder->frame_number;
 	
 	// 强制关键帧（第一帧或明确请求）
 	if (force_key || encoder->frame_number == 0) {
@@ -925,62 +998,51 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 	
 	encoder->frame_number++;
 
-	AVFrame *hw_frame = yuv_frame;
-	
-	// 对于VAAPI，需要上传到硬件帧
-	if (encoder->type == US_HWENC_VAAPI) {
-		hw_frame = av_frame_alloc();
-		if (!hw_frame) {
-			av_frame_free(&yuv_frame);
-			pthread_mutex_unlock(&encoder->mutex);
-			return US_HWENC_ERROR_MEMORY;
-		}
-		
-		ret = av_hwframe_get_buffer(encoder->ctx->hw_frames_ctx, hw_frame, 0);
-		if (ret < 0) {
-			char errbuf[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(ret, errbuf, sizeof(errbuf));
-			US_LOG_ERROR("HWENC: Failed to allocate VAAPI frame: %s", errbuf);
-			av_frame_free(&hw_frame);
-			av_frame_free(&yuv_frame);
-			pthread_mutex_unlock(&encoder->mutex);
-			return US_HWENC_ERROR_MEMORY;
-		}
-		
-		// 验证硬件帧上下文（按FFmpeg官方示例）
-		if (!hw_frame->hw_frames_ctx) {
-			US_LOG_ERROR("HWENC: Hardware frame context not set");
-			av_frame_free(&hw_frame);
-			av_frame_free(&yuv_frame);
-			pthread_mutex_unlock(&encoder->mutex);
-			return US_HWENC_ERROR_MEMORY;
-		}
-		
-		ret = av_hwframe_transfer_data(hw_frame, yuv_frame, 0);
-		if (ret < 0) {
-			char errbuf[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(ret, errbuf, sizeof(errbuf));
-			US_LOG_ERROR("HWENC: Failed to transfer data to VAAPI frame: %s", errbuf);
-			av_frame_free(&hw_frame);
-			av_frame_free(&yuv_frame);
-			pthread_mutex_unlock(&encoder->mutex);
-			return US_HWENC_ERROR_ENCODE;
-		}
-		
-		hw_frame->pts = yuv_frame->pts;
-		if (force_key || yuv_frame->pict_type == AV_PICTURE_TYPE_I) {
-			hw_frame->pict_type = AV_PICTURE_TYPE_I;
-		}
-	}
+    AVFrame *hw_frame = yuv_frame;
+    
+    // 对于VAAPI，需要上传到硬件帧（复用 hw_frame 对象）
+    if (encoder->type == US_HWENC_VAAPI) {
+        hw_frame = encoder->hw_frame;
+        av_frame_unref(hw_frame);
+        ret = av_hwframe_get_buffer(encoder->ctx->hw_frames_ctx, hw_frame, 0);
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            US_LOG_ERROR("HWENC: Failed to allocate VAAPI frame: %s", errbuf);
+            pthread_mutex_unlock(&encoder->mutex);
+            return US_HWENC_ERROR_MEMORY;
+        }
+        
+        // 验证硬件帧上下文（按FFmpeg官方示例）
+        if (!hw_frame->hw_frames_ctx) {
+            US_LOG_ERROR("HWENC: Hardware frame context not set");
+            pthread_mutex_unlock(&encoder->mutex);
+            return US_HWENC_ERROR_MEMORY;
+        }
+        
+        ret = av_hwframe_transfer_data(hw_frame, yuv_frame, 0);
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            US_LOG_ERROR("HWENC: Failed to transfer data to VAAPI frame: %s", errbuf);
+            pthread_mutex_unlock(&encoder->mutex);
+            return US_HWENC_ERROR_ENCODE;
+        }
+        
+        hw_frame->pts = yuv_frame->pts;
+        if (force_key || yuv_frame->pict_type == AV_PICTURE_TYPE_I) {
+            hw_frame->pict_type = AV_PICTURE_TYPE_I;
+        }
+    }
 
 	// 发送帧到编码器
 	ret = avcodec_send_frame(encoder->ctx, hw_frame);
 	
-	// 清理帧
-	if (encoder->type == US_HWENC_VAAPI && hw_frame != yuv_frame) {
-		av_frame_free(&hw_frame);
-	}
-	av_frame_free(&yuv_frame);
+    // 清理引用但不释放对象（复用）
+    if (encoder->type == US_HWENC_VAAPI) {
+        // 释放本帧使用的硬件 surface 引用，软帧继续复用
+        av_frame_unref(encoder->hw_frame);
+    }
 
 	if (ret < 0) {
 		pthread_mutex_unlock(&encoder->mutex);
@@ -1006,8 +1068,8 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		return US_HWENC_ERROR_ENCODE;
 	}
 
-	// 复制编码数据到目标帧
-	if (encoder->pkt->size > 0) {
+    // 复制编码数据到目标帧
+    if (encoder->pkt->size > 0) {
 		if (dest->allocated < (size_t)encoder->pkt->size) {
 			dest->data = realloc(dest->data, encoder->pkt->size);
 			if (!dest->data) {
@@ -1041,10 +1103,10 @@ us_hwenc_error_e us_ffmpeg_hwenc_compress(us_ffmpeg_hwenc_s *encoder,
 		           encoder->stats.frames_encoded, encoder->pkt->size, encode_time_ms);
 	}
 
-	av_packet_unref(encoder->pkt);
-	pthread_mutex_unlock(&encoder->mutex);
-	
-	return US_HWENC_OK;
+    av_packet_unref(encoder->pkt);
+    pthread_mutex_unlock(&encoder->mutex);
+    
+    return US_HWENC_OK;
 }
 
 // 获取统计信息
@@ -1062,7 +1124,7 @@ us_hwenc_error_e us_ffmpeg_hwenc_get_stats(us_ffmpeg_hwenc_s *encoder, us_hwenc_
 
 // 销毁编码器
 void us_ffmpeg_hwenc_destroy(us_ffmpeg_hwenc_s *encoder) {
-	if (!encoder) return;
+    if (!encoder) return;
 
 	US_LOG_DEBUG("HWENC: Destroying encoder (%s)", us_hwenc_type_to_string(encoder->type));
 
@@ -1077,9 +1139,12 @@ void us_ffmpeg_hwenc_destroy(us_ffmpeg_hwenc_s *encoder) {
 		avcodec_free_context(&encoder->ctx);
 	}
 	
-	if (encoder->frame) {
-		av_frame_free(&encoder->frame);
-	}
+    if (encoder->frame) {
+        av_frame_free(&encoder->frame);
+    }
+    if (encoder->hw_frame) {
+        av_frame_free(&encoder->hw_frame);
+    }
 	
 	if (encoder->pkt) {
 		av_packet_free(&encoder->pkt);

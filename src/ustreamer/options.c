@@ -101,9 +101,7 @@ enum _US_OPT_VALUES {
 	_O_H264_GOP,
 	_O_H264_M2M_DEVICE,
 #	ifdef WITH_FFMPEG
-	_O_H264_PRESET,
 	_O_H264_HWENC,
-	_O_H264_HWENC_FALLBACK,
 #	endif
 #	undef ADD_SINK
 
@@ -217,9 +215,7 @@ static const struct option _LONG_OPTS[] = {
 	{"h264-gop",				required_argument,	NULL,	_O_H264_GOP},
 	{"h264-m2m-device",			required_argument,	NULL,	_O_H264_M2M_DEVICE},
 #	ifdef WITH_FFMPEG
-	{"h264-preset",			required_argument,	NULL,	_O_H264_PRESET},
-	{"h264-hwenc",			required_argument,	NULL,	_O_H264_HWENC},
-	{"h264-hwenc-fallback",	no_argument,		NULL,	_O_H264_HWENC_FALLBACK},
+    {"h264-hwenc",			required_argument,	NULL,	_O_H264_HWENC},
 #	endif
 	// Compatibility
 	{"sink",					required_argument,	NULL,	_O_JPEG_SINK},
@@ -423,9 +419,7 @@ int options_parse(us_options_s *options, us_capture_s *cap, us_encoder_s *enc, u
 			case _O_DEVICE_ERROR_DELAY:	OPT_NUMBER("--device-error-delay", stream->error_delay, 1, 60, 0);
 			case _O_M2M_DEVICE:			OPT_SET(enc->m2m_path, optarg);
 #	ifdef WITH_FFMPEG
-			case _O_H264_PRESET:			OPT_SET(stream->h264_preset, optarg); break;
-			case _O_H264_HWENC:				OPT_SET(stream->h264_hwenc, optarg); break;
-			case _O_H264_HWENC_FALLBACK:	OPT_SET(stream->h264_hwenc_fallback, true); break;
+            case _O_H264_HWENC:				OPT_SET(stream->h264_hwenc, optarg); break;
 #	endif
 			case _O_IMAGE_DEFAULT:
 				OPT_CTL_DEFAULT_NOBREAK(brightness);
@@ -816,11 +810,8 @@ static void _help(FILE *fp, const us_capture_s *cap, const us_encoder_s *enc, co
 	SAY("    --h264-gop <N>  ──────────────── Interval between keyframes. Default: %u.\n", stream->h264_gop);
 	SAY("    --h264-m2m-device </dev/path>  ─ Path to V4L2 M2M encoder device. Default: auto select.\n");
 #	ifdef WITH_FFMPEG
-	SAY("    --h264-preset <string>  ───────── FFmpeg encoder preset. Default: ultrafast.\n");
-	SAY("    --h264-hwenc <type>  ──────────── Hardware encoder type (vaapi, nvenc, amf, v4l2m2m, rkmpp, mediacodec, videotoolbox).\n");
-	SAY("                                       Falls back to software encoding if hardware encoding fails. Default: disabled.\n");
-	SAY("    --h264-hwenc-fallback  ────────── Always fallback to software encoding if hardware encoding is unavailable.\n");
-	SAY("                                       Default: disabled.\n");
+    SAY("    --h264-hwenc <type>  ──────────── Hardware encoder type (vaapi, nvenc, amf, v4l2m2m, rkmpp, mediacodec, videotoolbox).\n");
+    SAY("                                       If hardware init fails, it will fallback to software (libx264).\n");
 #	endif
 #	if defined(WITH_DRM) || defined(WITH_V4P)
 	SAY("Direct display options:");

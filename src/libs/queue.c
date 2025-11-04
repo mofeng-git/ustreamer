@@ -105,8 +105,9 @@ int us_queue_get(us_queue_s *queue, void **item, ldf timeout) {
 #undef _WAIT_OR_UNLOCK
 
 bool us_queue_is_empty(us_queue_s *queue) {
-	US_MUTEX_LOCK(queue->mutex);
-	const uint size = queue->size;
-	US_MUTEX_UNLOCK(queue->mutex);
-	return (bool)(queue->capacity - size);
+    US_MUTEX_LOCK(queue->mutex);
+    const uint size = queue->size;
+    US_MUTEX_UNLOCK(queue->mutex);
+    // 修复：应返回“是否为空”，而不是“未满”
+    return size == 0;
 }

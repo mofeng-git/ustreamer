@@ -57,26 +57,29 @@ struct AVFilterContext;
 
 // FFmpeg硬件编码器结构体
 typedef struct {
-	// FFmpeg资源
-	struct AVCodecContext *ctx;
-	struct AVFrame *frame;
-	struct AVPacket *pkt;
-	struct SwsContext *sws_ctx;
-	struct AVBufferRef *hw_device_ctx;
-	struct AVBufferRef *hw_frames_ctx;
+    // FFmpeg资源
+    struct AVCodecContext *ctx;
+    struct AVFrame *frame;
+    // VAAPI 等硬件路径复用的硬件帧容器（仅对象复用，底层surface由池分配）
+    struct AVFrame *hw_frame;
+    struct AVPacket *pkt;
+    struct SwsContext *sws_ctx;
+    struct AVBufferRef *hw_device_ctx;
+    struct AVBufferRef *hw_frames_ctx;
 	
 	// 编码器信息
 	us_hwenc_type_e type;
 	char codec_name[64];
 	char device_path[256];
 	
-	// 配置参数
-	int width;
-	int height;
-	uint bitrate_kbps;
-	uint gop_size;
-	int fps_num;
-	int fps_den;
+    // 配置参数
+    int width;
+    int height;
+    uint bitrate_kbps;
+    uint gop_size;
+    int fps_num;
+    int fps_den;
+    int sw_alignment; // 软帧对齐（RKMPP=64，否则32）
 	
 	// 状态管理
 	atomic_bool initialized;
